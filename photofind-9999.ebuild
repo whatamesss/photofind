@@ -5,38 +5,35 @@ EAPI=8
 
 PYTHON_COMPAT=( python3_13 )
 DISTUTILS_USE_PEP517=setuptools
-inherit python-single-r1 desktop
+inherit git-r3 python-single-r1 desktop
 
 DESCRIPTION="Local AI-powered photo search and organizer using CLIP and PyQt6"
 HOMEPAGE="https://github.com/whatamesss/photofind"
-SRC_URI="https://github.com/whatamesss/photofind/archive/refs/tags/v${PV}.tar.gz"
+
+EGIT_REPO_URI="https://github.com/whatamesss/photofind.git"
 
 LICENSE="GPL-3+"
 SLOT="0"
-KEYWORDS="~amd64 ~x86"
-IUSE="jdupes"  # CUDA flag removed, managed manually via package.use
+KEYWORDS=""
+IUSE="jdupes"
 
 REQUIRED_USE="${PYTHON_REQUIRED_USE}"
 
 RDEPEND="${PYTHON_DEPS}
-    dev-python/PyQt6[${PYTHON_SINGLE_USEDEP},gui,widgets]
-    dev-python/pillow[${PYTHON_SINGLE_USEDEP}]
-    dev-python/transformers[${PYTHON_SINGLE_USEDEP}]
-    dev-python/numpy[${PYTHON_SINGLE_USEDEP}]
-    dev-python/tqdm[${PYTHON_SINGLE_USEDEP}]
-
-    # PyTorch and Caffe2 flags are managed globally/locally in package.use
-    # to ensure proper propagation of CUDA support.
-    sci-libs/pytorch[${PYTHON_SINGLE_USEDEP},python]
+    dev-python/pyqt6[gui,widgets]
+    dev-python/pillow
+    sci-ml/transformers[torch]
+    dev-python/numpy
+    dev-python/tqdm
+    sci-ml/pytorch[${PYTHON_SINGLE_USEDEP}]
     sci-ml/caffe2
-
-    xdg-utils
+    x11-misc/xdg-utils
     jdupes? ( app-misc/jdupes )
 "
 
 BDEPEND=""
 
-S="${WORKDIR}/${PN}-${PV}"
+S="${WORKDIR}/${P}"
 
 src_install() {
     python_newscript photofind.py photofind
