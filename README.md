@@ -30,6 +30,8 @@ You must explicitly enable the `torch` backend for the Hugging Face libraries.
 echo "sci-ml/transformers torch" >> /etc/portage/package.use/photofind
 echo "sci-ml/huggingface_hub torch" >> /etc/portage/package.use/photofind
 
+If you have jdupes insatlled for de-duplication, add a jdupes USE flag to photofind:
+echo "media-gfx/photofind jdupes" >> /etc/portage/package.use/photofind
 
 If you have an NVIDIA graphics card with CUDA capability, enable the `cuda` flag to the backend.
 
