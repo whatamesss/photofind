@@ -1075,7 +1075,7 @@ class PhotoOrganizerWindow(QMainWindow):
             
         event.accept()
 
-    def _show_temp_status(self, message: str, duration_ms: int = 3000) -> None:
+    def _show_temp_status(self, message: str, duration_ms: int = 5000) -> None:
         """Shows a message in the status bar, then reverts to the default 'Ready' message."""
         self.statusBar().showMessage(message)
         default_msg = f"Ready. {len(self.searcher.indexed_set)} images indexed."
