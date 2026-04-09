@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QCompleter
 )
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QAction, QKeySequence, QShortcut, QDesktopServices
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint, QTimer
 
 # --- Helper Functions ---
 
@@ -740,7 +740,8 @@ class DuplicateDialog(QDialog):
         self.image_list.setIconSize(QSize(200, 200))
         self.image_list.setResizeMode(QListWidget.ResizeMode.Fixed)
         self.image_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.image_list.itemClicked.connect(self.show_image_info)
+        # FIX: Changed itemClicked to currentItemChanged
+        self.image_list.currentItemChanged.connect(self._handle_dupes_image_selection)
         self.image_list.itemDoubleClicked.connect(self.dupes_open_in_explorer)
         self.image_list.itemSelectionChanged.connect(self.update_trash_btn_state)
         self.image_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -844,6 +845,11 @@ class DuplicateDialog(QDialog):
             self.image_list.addItem(item)
             threading.Thread(target=self._load_thumb, args=(path,), daemon=True).start()
         if len(group) > 1: self.trash_rest_btn.setEnabled(True)
+
+    # FIX: Added wrapper for currentItemChanged signal
+    def _handle_dupes_image_selection(self, current: Optional[QListWidgetItem], previous: Optional[QListWidgetItem]) -> None:
+        if current:
+            self.show_image_info(current)
 
     def show_image_info(self, item: QListWidgetItem) -> None:
         path = item.data(Qt.ItemDataRole.UserRole)
@@ -1069,6 +1075,12 @@ class PhotoOrganizerWindow(QMainWindow):
             
         event.accept()
 
+    def _show_temp_status(self, message: str, duration_ms: int = 3000) -> None:
+        """Shows a message in the status bar, then reverts to the default 'Ready' message."""
+        self.statusBar().showMessage(message)
+        default_msg = f"Ready. {len(self.searcher.indexed_set)} images indexed."
+        QTimer.singleShot(duration_ms, lambda: self.statusBar().showMessage(default_msg))
+
     def setup_ui(self) -> None:
         central_widget = QWidget(); self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
@@ -1091,7 +1103,9 @@ class PhotoOrganizerWindow(QMainWindow):
         self.list_widget = QListWidget()
         self.list_widget.setViewMode(QListWidget.ViewMode.IconMode); self.list_widget.setIconSize(QSize(200, 200))
         self.list_widget.setResizeMode(QListWidget.ResizeMode.Adjust); self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.list_widget.itemDoubleClicked.connect(self.open_image); self.list_widget.itemClicked.connect(self.show_path_in_status)
+        self.list_widget.itemDoubleClicked.connect(self.open_image)
+        # FIX: Changed itemClicked to currentItemChanged
+        self.list_widget.currentItemChanged.connect(self.show_path_in_status)
         self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu); self.list_widget.customContextMenuRequested.connect(self.show_context_menu)
         layout.addWidget(self.list_widget)
         self.setStatusBar(QStatusBar())
@@ -1161,7 +1175,7 @@ class PhotoOrganizerWindow(QMainWindow):
             self.clean_worker.start()
 
     def clean_finished(self, removed_count: int) -> None:
-        self.statusBar().showMessage(f"Clean complete. Removed {removed_count} missing files.")
+        self._show_temp_status(f"Clean complete. Removed {removed_count} missing files.")
         self.searcher.load_index()
 
     def show_context_menu(self, position: int) -> None:
@@ -1196,7 +1210,7 @@ class PhotoOrganizerWindow(QMainWindow):
                 else: fail.append(p)
             for item in reversed([i for i in items if i.data(Qt.ItemDataRole.UserRole) in success]): self.list_widget.takeItem(self.list_widget.row(item))
             if fail: QMessageBox.warning(self, "Error", f"Could not move {len(fail)} files to trash.")
-            else: self.statusBar().showMessage(f"Moved {count} photos to Trash.")
+            else: self._show_temp_status(f"Moved {count} photos to Trash.")
 
     def open_in_explorer(self, path: str) -> None:
         try:
@@ -1231,20 +1245,20 @@ class PhotoOrganizerWindow(QMainWindow):
         # This is now handled by the dialog button, but keep for ESC key compatibility
         if self.dupes_dialog: self.dupes_dialog.stop_scan()
 
-    def dupes_finished(self, duration: float) -> None:
+    def dupes_finished(self, duration: float, message_override: Optional[str] = None) -> None:
         if self.dupes_dialog: self.dupes_dialog.stream_finished(duration)
         self.reset_dupes_ui_state()
-        self.statusBar().showMessage(f"Duplicate scan complete. Took {format_duration(duration)}.")
+        msg = message_override if message_override else f"Duplicate scan complete. Took {format_duration(duration)}."
+        self._show_temp_status(msg)
 
     def dupes_cancelled(self) -> None:
-        self.statusBar().showMessage("Duplicate scan cancelled.")
-        self.dupes_finished(0.0)
+        self.dupes_finished(0.0, message_override="Duplicate scan cancelled.")
 
     def dupes_error(self, msg: str) -> None:
         QMessageBox.warning(self, "Deduplication Error", msg); 
         if self.dupes_dialog: self.dupes_dialog.close()
         self.reset_dupes_ui_state()
-        self.statusBar().showMessage("Duplicate scan failed.")
+        self._show_temp_status("Duplicate scan failed.")
 
     def reset_dupes_ui_state(self) -> None:
         self.dupes_action.setEnabled(self.has_jdupes); 
@@ -1266,7 +1280,7 @@ class PhotoOrganizerWindow(QMainWindow):
     def indexing_finished(self, count: int, duration: float) -> None:
         self.progress_bar.setVisible(False); self.stop_index_btn.setVisible(False); self.index_worker = None
         dur_str = format_duration(duration)
-        self.statusBar().showMessage(f"Indexing complete ({dur_str}). Total images: {len(self.searcher.indexed_set)}")
+        self._show_temp_status(f"Indexing complete ({dur_str}). Total images: {len(self.searcher.indexed_set)}")
 
     def start_search(self) -> None:
         query = self.search_input.text().strip()
@@ -1284,7 +1298,9 @@ class PhotoOrganizerWindow(QMainWindow):
 
     def display_results(self, hits: List[Dict[str, Any]]) -> None:
         self.list_widget.clear(); self.current_results = hits
-        if not hits: self.statusBar().showMessage("No results found."); return
+        if not hits: 
+            self._show_temp_status("No results found.")
+            return
         self.statusBar().showMessage(f"Found {len(hits)} results. Loading thumbnails...")
         paths_to_load = []
         for hit in hits:
@@ -1308,12 +1324,17 @@ class PhotoOrganizerWindow(QMainWindow):
         for i in range(self.list_widget.count()):
             if self.list_widget.item(i).data(Qt.ItemDataRole.UserRole) == path: self.list_widget.item(i).setIcon(QIcon(pixmap)); return
 
-    def show_path_in_status(self, item: QListWidgetItem) -> None:
+    # FIX: Updated signature to match currentItemChanged
+    def show_path_in_status(self, current: Optional[QListWidgetItem], previous: Optional[QListWidgetItem]) -> None:
+        if not current:
+            self.statusBar().showMessage("Ready")
+            return
+            
         selected_count = len(self.list_widget.selectedItems())
         if selected_count > 1:
             self.statusBar().showMessage(f"{selected_count} items selected")
         else:
-            path = item.data(Qt.ItemDataRole.UserRole)
+            path = current.data(Qt.ItemDataRole.UserRole)
             self.statusBar().showMessage(f"{path}  |  Size: {self._format_file_size(path)}")
 
     def open_image(self, item: QListWidgetItem) -> None:
