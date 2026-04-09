@@ -11,7 +11,7 @@ DESCRIPTION="Local AI-powered photo search and organizer using CLIP and PyQt6"
 HOMEPAGE="https://github.com/whatamesss/photofind"
 SRC_URI="https://github.com/whatamesss/photofind/archive/refs/tags/v${PV}.tar.gz"
 
-LICENSE="MIT"
+LICENSE="GPL-3+"
 SLOT="0"
 KEYWORDS="~amd64 ~x86"
 IUSE="jdupes"  # CUDA flag removed, managed manually via package.use
