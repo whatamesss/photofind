@@ -33,8 +33,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint, QT
 
 SEARCH_FLOOR_MIN = 0.19
 SEARCH_FLOOR_RATIO = 0.55
-SEARCH_TOP_K = 68
-# CHANGED: More aggressive — we want ~90% VRAM usage for indexing
+SEARCH_TOP_K = 60
 VRAM_TARGET_RATIO = 0.90
 MAX_BATCH_SIZE = 512
 
@@ -340,7 +339,6 @@ class PhotoSearch:
                 logging.warning("GPU too small for CLIP. Using CPU for all batches.")
         else: self.current_batch_size = 8
 
-        # CHANGED: More loader threads — image loading is I/O bound, not CPU bound
         max_loaders = min(16, max(6, (os.cpu_count() or 4) * 2))
         load_queue = queue.Queue(maxsize=600)
         gpu_queue = queue.Queue(maxsize=4)
