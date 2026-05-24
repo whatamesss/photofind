@@ -1,4 +1,4 @@
-# photofind
+# photofind is a complex python script written by robots but methodically designed and refined by myself! i welcome any contributions! 
 
 **photofind** is a local, AI-powered photo search tool written in Python. It provides a graphical user interface (Qt6) to help you organize, search, and clean up massive photo collections using natural language.
 
