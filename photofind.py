@@ -36,6 +36,7 @@ SEARCH_FLOOR_RATIO = 0.55
 SEARCH_TOP_K = 60
 VRAM_TARGET_RATIO = 0.90
 MAX_BATCH_SIZE = 512
+VRAM_RESERVE_MB = 512  # Flat, configurable VRAM reserve
 
 _CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32).reshape(1, 1, 3)
 _CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32).reshape(1, 1, 3)
@@ -64,6 +65,7 @@ def _numpy_to_clip_arrays(img: Image.Image) -> Tuple[np.ndarray, float, float]:
     dx = np.abs(gray[:, 2:] - gray[:, :-2])
     dy = np.abs(gray[2:, :] - gray[:-2, :])
     edge_score = float(np.mean(dx) + np.mean(dy))
+    # CPU float32 math (optimal for overlapping PCIe transfer)
     arr = arr_uint8.astype(np.float32) / 255.0
     arr = (arr - _CLIP_MEAN) / _CLIP_STD
     arr = np.ascontiguousarray(arr.transpose(2, 0, 1))
@@ -210,44 +212,50 @@ class PhotoSearch:
         return features.cpu().half()
 
     def _calibrate_batch_size(self) -> int:
-        """Synthetic calibration with adaptive probing. Tests cuDNN, then finds max safe batch."""
+        """Synthetic calibration with adaptive probing. Skips unsupported cuDNN on older GPUs."""
         if self.device != "cuda": return 8
         gc.collect(); torch.cuda.empty_cache()
         free_vram, _ = torch.cuda.mem_get_info()
-        logging.info(f"Calibrating batch size (free VRAM: {free_vram / (1024**2):.0f}MB)...")
+        
+        cap_major, _ = torch.cuda.get_device_capability(self.device)
+        force_cudnn_off = (cap_major < 7.0)
+        
+        logging.info(f"Calibrating batch size (free VRAM: {free_vram / (1024**2):.0f}MB, Compute Cap: {cap_major}.x)...")
 
-        # Test cuDNN compatibility
-        for try_cudnn in [True, False]:
+        probe_sequence = [False] if force_cudnn_off else [True, False]
+
+        for try_cudnn in probe_sequence:
             torch.backends.cudnn.enabled = try_cudnn
-            torch.backends.cudnn.benchmark = try_cudnn
+            torch.backends.cudnn.benchmark = False
             dummy_pv = None
             try:
                 dummy_pv = torch.randn(2, 3, 224, 224, device=self.device, dtype=torch.float16)
                 torch.cuda.synchronize()
                 mem_before = torch.cuda.memory_allocated()
                 torch.cuda.reset_peak_memory_stats()
-                with torch.no_grad():
-                    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                        out = self.model.vision_model(pixel_values=dummy_pv)
-                        pooled = out.pooler_output if hasattr(out, 'pooler_output') else out[1]
-                        features = self.model.visual_projection(pooled)
+                with self._model_lock:
+                    with torch.no_grad():
+                        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                            out = self.model.vision_model(pixel_values=dummy_pv)
+                            pooled = out.pooler_output if hasattr(out, 'pooler_output') else out[1]
+                            features = self.model.visual_projection(pooled)
                 torch.cuda.synchronize()
                 peak_delta = torch.cuda.max_memory_allocated() - mem_before
                 bytes_per_img_2 = max(peak_delta / 2, 1)
                 del dummy_pv, out, pooled, features; torch.cuda.empty_cache()
 
-                # Probe with larger batch for more accurate per-image cost
                 probe_bs = min(16, int(free_vram * 0.15 / bytes_per_img_2), MAX_BATCH_SIZE)
                 if probe_bs >= 4:
                     probe_pv = torch.randn(probe_bs, 3, 224, 224, device=self.device, dtype=torch.float16)
                     torch.cuda.synchronize()
                     mem_before = torch.cuda.memory_allocated()
                     torch.cuda.reset_peak_memory_stats()
-                    with torch.no_grad():
-                        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                            out = self.model.vision_model(pixel_values=probe_pv)
-                            pooled = out.pooler_output if hasattr(out, 'pooler_output') else out[1]
-                            features = self.model.visual_projection(pooled)
+                    with self._model_lock:
+                        with torch.no_grad():
+                            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                                out = self.model.vision_model(pixel_values=probe_pv)
+                                pooled = out.pooler_output if hasattr(out, 'pooler_output') else out[1]
+                                features = self.model.visual_projection(pooled)
                     torch.cuda.synchronize()
                     peak_delta_big = torch.cuda.max_memory_allocated() - mem_before
                     bytes_per_img_large = peak_delta_big / probe_bs
@@ -256,22 +264,15 @@ class PhotoSearch:
                 else:
                     bytes_per_img = bytes_per_img_2
 
-                # 15% safety margin on inference memory (covers attention softmax spikes)
-                # + explicit reserve for prefetched next batch pixel values
-                prefetch_bytes_per_img = 3 * 224 * 224 * 2  # ~0.29 MB/img
-                safe_bytes_per_img = (bytes_per_img * 1.15) + prefetch_bytes_per_img
+                reserve_bytes = VRAM_RESERVE_MB * (1024**2)
+                safe_available = max(free_vram - reserve_bytes, 0)
 
-                # Hard reserve 256MB for display server / allocator fragmentation / OS
-                # This prevents the caching allocator from expanding to 100% in nvtop
-                display_reserve = 512 * (1024**2)
-                safe_available = max(free_vram - display_reserve, 0)
-
-                target_bs = int(safe_available / safe_bytes_per_img)
+                target_bs = int(safe_available / bytes_per_img)
                 target_bs = max(2, min(target_bs, MAX_BATCH_SIZE))
 
                 logging.info(f"Calibration (cuDNN={'ON' if try_cudnn else 'OFF'}): "
                              f"{bytes_per_img / (1024**2):.1f}MB/img. "
-                             f"Available: {safe_available / (1024**2):.0f}MB (after 256MB reserve). "
+                             f"Reserving {VRAM_RESERVE_MB}MB. "
                              f"Batch size: {target_bs}")
                 self._cudnn_ok = try_cudnn
                 return target_bs
@@ -281,7 +282,7 @@ class PhotoSearch:
                     logging.warning(f"cuDNN={'ON' if try_cudnn else 'OFF'} failed: {e}")
                     if dummy_pv is not None: del dummy_pv
                     torch.cuda.empty_cache()
-                    if not try_cudnn:
+                    if not try_cudnn or force_cudnn_off:
                         logging.warning("GPU calibration failed entirely. Using CPU fallback.")
                         self._cudnn_ok = False; self._gpu_fully_oom = True; return 16
                     logging.info("Disabling cuDNN (not supported on this GPU)...")
@@ -390,32 +391,13 @@ class PhotoSearch:
 
         new_embeddings, new_paths, new_metadata = [], [], []
         processed_count = 0; cancelled = False
-        use_prefetch = (self.device == "cuda" and not self._gpu_fully_oom)
-        prefetch_stream = torch.cuda.Stream() if use_prefetch else None
-        next_pv, next_arr, next_info = None, None, None
-
-        def _try_prefetch() -> bool:
-            nonlocal next_pv, next_arr, next_info
-            if next_pv is not None: return True
-            try: item = gpu_queue.get_nowait()
-            except queue.Empty: return False
-            if item == "DONE": return False
-            a, p, m = item; tensor = torch.from_numpy(a)
-            with torch.cuda.stream(prefetch_stream):
-                next_pv = tensor.pin_memory().to(self.device, non_blocking=True)
-            next_arr = a; next_info = (p, m); return True
 
         while True:
             if cancel_check and cancel_check(): cancelled = True; break
-            if next_pv is not None:
-                torch.cuda.current_stream().wait_stream(prefetch_stream)
-                pv = next_pv; arr = next_arr; batch_map, batch_meta = next_info
-                next_pv = None; next_arr = None; next_info = None
-            else:
-                try: item = gpu_queue.get(timeout=1.0)
-                except queue.Empty: continue
-                if item == "DONE": break
-                arr, batch_map, batch_meta = item; pv = None
+            try: item = gpu_queue.get(timeout=1.0)
+            except queue.Empty: continue
+            if item == "DONE": break
+            arr, batch_map, batch_meta = item
 
             batch_size_actual = len(batch_map)
             if self._gpu_fully_oom:
@@ -428,13 +410,13 @@ class PhotoSearch:
                 continue
 
             pv = torch.from_numpy(arr).pin_memory().to(self.device, non_blocking=True)
+            
             try:
                 features = self._compute_vision_embeddings(pv)
                 new_embeddings.append(features); new_paths.extend(batch_map); new_metadata.extend(batch_meta)
                 del pv, features; processed_count += batch_size_actual
                 if progress_callback:
                     progress_callback(f"Indexing... {processed_count}/{total_files} (BS: {self.current_batch_size})", processed_count, total_files)
-                if prefetch_stream: _try_prefetch()
             except RuntimeError as e:
                 err_str = str(e).lower()
                 if "out of memory" in err_str or "unable to find an engine" in err_str:
@@ -522,13 +504,39 @@ class PhotoSearch:
 
     def clean_database(self, progress_callback: Optional[Callable[[str], None]] = None) -> int:
         if not self.image_paths: return 0
-        valid_paths, valid_indices, removed_count, total = [], [], 0, len(self.image_paths)
+        valid_paths, valid_indices, removed_count = [], [], 0
+        dir_map: Dict[str, List[int]] = {}
         for i, path in enumerate(self.image_paths):
-            if os.path.exists(path): valid_paths.append(path); valid_indices.append(i)
+            d = os.path.dirname(path)
+            if d not in dir_map: dir_map[d] = []
+            dir_map[d].append(i)
+            
+        total_dirs = len(dir_map)
+        for dir_idx, (directory, indices) in enumerate(dir_map.items()):
+            if progress_callback and dir_idx % 500 == 0: 
+                progress_callback(f"Verifying directories... {dir_idx}/{total_dirs}")
+                
+            if not os.path.exists(directory):
+                removed_count += len(indices)
+                for i in indices:
+                    p = self.image_paths[i]
+                    if p in self.image_metadata: del self.image_metadata[p]
             else:
-                removed_count += 1
-                if path in self.image_metadata: del self.image_metadata[path]
-            if progress_callback and i % 1000 == 0: progress_callback(f"Verifying... {i}/{total}")
+                try:
+                    actual_files = set(os.listdir(directory))
+                except PermissionError:
+                    actual_files = set()
+                    
+                for i in indices:
+                    filename = os.path.basename(self.image_paths[i])
+                    if filename in actual_files:
+                        valid_paths.append(self.image_paths[i])
+                        valid_indices.append(i)
+                    else:
+                        removed_count += 1
+                        p = self.image_paths[i]
+                        if p in self.image_metadata: del self.image_metadata[p]
+
         if removed_count > 0:
             logging.info(f"Cleaning database: Removing {removed_count} missing files.")
             with self._lock:
@@ -545,9 +553,7 @@ class PhotoSearch:
     def mark_photo_deleted(self, file_path: str) -> None:
         with self._lock:
             if file_path in self.image_metadata: self.image_metadata[file_path]['deleted'] = True
-            self._embeddings_dirty = True
             with open(self.metadata_file, "w", errors='surrogateescape') as f: json.dump(self.image_metadata, f)
-            if file_path in self.indexed_set: self.indexed_set.remove(file_path)
 
     def _get_embeddings_gpu(self) -> torch.Tensor:
         with self._lock:
@@ -557,31 +563,64 @@ class PhotoSearch:
                 if self.device == "cuda" and self._embeddings_on_gpu.dtype != torch.float16:
                     self._embeddings_on_gpu = self._embeddings_on_gpu.half()
                 self._embeddings_device, self._embeddings_dirty = self.device, False
-            return self._embeddings_on_gpu.clone()
+            return self._embeddings_on_gpu
+
+    def _check_file_access(self, path: str) -> Optional[str]:
+        if os.path.exists(path): return None
+        p, existing_parent = Path(path), Path(path)
+        while not existing_parent.exists() and existing_parent != Path('/'): existing_parent = existing_parent.parent
+        str_parent = str(existing_parent)
+        if '/media/' in str_parent or '/mnt/' in str_parent or '/run/media/' in str_parent: return f"Filesystem {existing_parent} not available, please mount"
+        return "File not found"
 
     def search(self, query: str, top_k: int = SEARCH_TOP_K) -> List[Dict[str, Any]]:
         if self.image_embeddings is None or len(self.image_embeddings) == 0: return []
         if self.image_embeddings.shape[1] != self.embedding_dim:
             logging.error(f"Embedding dimension mismatch. Please re-index."); return []
         search_text = f"a photo of a {query}" if len(query.split()) < 4 else query
-        inputs = self.processor(text=[search_text], return_tensors="pt", padding=True)
+        
+        with self._model_lock:
+            inputs = self.processor(text=[search_text], return_tensors="pt", padding=True)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
         with self._model_lock, torch.no_grad():
             with torch.amp.autocast(device_type='cuda' if self.device == "cuda" else 'cpu', dtype=torch.float16):
                 text_outputs = self.model.text_model(input_ids=inputs.get('input_ids'), attention_mask=inputs.get('attention_mask'))
-                text_features = self.model.text_projection(text_outputs.pooler_output if hasattr(text_outputs, 'pooler_output') else text_outputs[1])
-                text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
+                pooled = text_outputs.pooler_output if hasattr(text_outputs, 'pooler_output') else text_outputs[1]
+                text_features = self.model.text_projection(pooled)
+            text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
+            if self.device == "cuda":
+                text_features = text_features.half()
+
+        with torch.no_grad():
             embeddings = self._get_embeddings_gpu()
-            similarities = (embeddings.float() @ text_features.float().T).squeeze(1)
-            requested_k = min(top_k * 10, len(similarities)); values, indices = torch.topk(similarities, requested_k)
-        scores, idxs = values.float().cpu().numpy(), indices.cpu().numpy()
-        if len(scores) == 0: return []
-        effective_floor = max(SEARCH_FLOOR_MIN, scores[0] * SEARCH_FLOOR_RATIO); results = []
-        for i in range(len(scores)):
-            if scores[i] < effective_floor: continue
-            fp = self.image_paths[idxs[i]]; meta = self.image_metadata.get(fp, {})
-            if not meta.get('deleted') and not self._is_garbage(meta): results.append({"file": fp, "score": float(scores[i])})
+            similarities = torch.mm(embeddings, text_features.T).squeeze().float()
+            requested_k = min(top_k * 10, len(similarities))
+            values, indices = torch.topk(similarities, requested_k)
+
+        scores_np = values.cpu().numpy()
+        idxs_np = indices.cpu().numpy()
+        
+        if len(scores_np) == 0: return []
+        
+        effective_floor = max(SEARCH_FLOOR_MIN, float(scores_np[0]) * SEARCH_FLOOR_RATIO)
+        results = []
+        
+        for i in range(len(scores_np)):
+            score = float(scores_np[i])
+            if score < effective_floor: break
+            
+            idx = int(idxs_np[i])
+            fp = self.image_paths[idx]
+            
+            meta = self.image_metadata.get(fp)
+            if meta and meta.get('deleted'): continue
+            if meta and self._is_garbage(meta): continue
+            if not os.path.exists(fp): continue
+                
+            results.append({"file": fp, "score": score})
             if len(results) >= top_k: break
+            
         return results
 
     def _is_garbage(self, meta: Dict[str, Any]) -> bool:
@@ -592,7 +631,7 @@ class PhotoSearch:
     def get_garbage_photos(self) -> List[Dict[str, Any]]:
         return [{"file": p, "score": 0.0, "is_garbage": True}
                 for p, m in self.image_metadata.items()
-                if os.path.exists(p) and not m.get('deleted') and self._is_garbage(m)]
+                if self._check_file_access(p) is None and not m.get('deleted') and self._is_garbage(m)]
 
 
 class IndexWorker(QThread):
@@ -602,7 +641,10 @@ class IndexWorker(QThread):
     def cancel(self): self._cancelled = True
     def run(self):
         start_time = time.time()
-        self.searcher.index_photos(self.directory, lambda m,c,t: self.progress.emit(m,c,t), lambda: self._cancelled)
+        try:
+            self.searcher.index_photos(self.directory, lambda m,c,t: self.progress.emit(m,c,t), lambda: self._cancelled)
+        except Exception as e:
+            logging.error(f"Indexing aborted due to error: {e}")
         self.result_ready.emit(0, time.time() - start_time)
 
 
@@ -938,23 +980,17 @@ class PhotoOrganizerWindow(QMainWindow):
         self.current_results, self.thumb_worker, self.dupes_worker, self.dupes_dialog = [], None, None, None
         self.index_worker, self.search_worker, self.garbage_worker, self.clean_worker = None, None, None, None
         self._path_to_item = {}
-        if self.searcher.load_index(): self._check_stale_paths()
+        
+        self._is_indexing = False
+        self._pending_search_query = None
+
+        if self.searcher.load_index(): self.statusBar().showMessage(self._get_idle_status_message())
         else: self.statusBar().showMessage("Ready. No index loaded.")
 
-    def _check_stale_paths(self) -> None:
-        if not self.searcher.image_paths: self.statusBar().showMessage(self._get_idle_status_message()); return
         sample_size = min(100, len(self.searcher.image_paths)); sample = random.sample(self.searcher.image_paths, sample_size)
         missing = sum(1 for p in sample if not os.path.exists(p))
         if missing > 0: self.statusBar().showMessage(f"Warning: {missing}/{sample_size} sampled images missing. Consider 'Clean Database'.")
         else: self.statusBar().showMessage(self._get_idle_status_message())
-
-    def _check_file_access(self, path: str) -> Optional[str]:
-        if os.path.exists(path): return None
-        p, existing_parent = Path(path), Path(path)
-        while not existing_parent.exists() and existing_parent != Path('/'): existing_parent = existing_parent.parent
-        str_parent = str(existing_parent)
-        if '/media/' in str_parent or '/mnt/' in str_parent or '/run/media/' in str_parent: return f"Filesystem {existing_parent} not available, please mount"
-        return "File not found"
 
     def _get_idle_status_message(self) -> str:
         parts = [f"Ready. {len(self.searcher.indexed_set)} images indexed."]; stats = self.searcher.stats
@@ -967,7 +1003,7 @@ class PhotoOrganizerWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
-            if self.index_worker and self.index_worker.isRunning(): self.index_worker.cancel()
+            if self._is_indexing and self.index_worker: self.index_worker.cancel()
             if self.dupes_worker and self.dupes_worker.isRunning(): self.dupes_worker.stop()
         except RuntimeError: pass
         if self.dupes_dialog and self.dupes_dialog.isVisible(): self.dupes_dialog.close()
@@ -1008,8 +1044,19 @@ class PhotoOrganizerWindow(QMainWindow):
         clear_action = QAction("Clear Screen", self); clear_action.setToolTip("Clear search results and reset UI"); clear_action.triggered.connect(self.clear_screen); toolbar.addAction(clear_action)
 
     def setup_shortcuts(self) -> None:
-        QShortcut(QKeySequence("Ctrl+F"), self, self.search_input.setFocus); QShortcut(QKeySequence("Ctrl+A"), self, self.list_widget.selectAll)
-        QShortcut(QKeySequence(Qt.Key.Key_Delete), self, self.delete_selected); QShortcut(QKeySequence("Escape"), self, self.cancel_current_operation)
+        QShortcut(QKeySequence("Ctrl+F"), self, self.search_input.setFocus)
+        QShortcut(QKeySequence("Ctrl+A"), self, self.list_widget.selectAll)
+        QShortcut(QKeySequence(Qt.Key.Key_Delete), self, self.delete_selected)
+        QShortcut(QKeySequence("Escape"), self, self.cancel_current_operation)
+        # Bind Enter specifically to the list widget using WidgetShortcut 
+        # so it doesn't intercept Enter from the search box
+        QShortcut(QKeySequence(Qt.Key.Key_Return), self.list_widget, self._open_selected_image, context=Qt.ShortcutContext.WidgetShortcut)
+        QShortcut(QKeySequence(Qt.Key.Key_Enter), self.list_widget, self._open_selected_image, context=Qt.ShortcutContext.WidgetShortcut)
+
+    def _open_selected_image(self) -> None:
+        current = self.list_widget.currentItem()
+        if current:
+            self.open_image(current)
 
     def _format_file_size(self, path: str) -> str:
         try:
@@ -1026,7 +1073,8 @@ class PhotoOrganizerWindow(QMainWindow):
 
     def cancel_current_operation(self) -> None:
         try:
-            if self.index_worker and self.index_worker.isRunning(): self.index_worker.cancel(); self.statusBar().showMessage("Cancelling indexing...")
+            if self._is_indexing:
+                self.index_worker.cancel(); self.statusBar().showMessage("Cancelling indexing...")
             elif self.dupes_worker and self.dupes_worker.isRunning():
                 if self.dupes_dialog: self.dupes_dialog.stop_scan()
         except RuntimeError: pass
@@ -1066,7 +1114,7 @@ class PhotoOrganizerWindow(QMainWindow):
             else: self._show_temp_status(f"Moved {count} photos to Trash.")
 
     def open_image_viewer(self, path: str) -> None:
-        err = self._check_file_access(path)
+        err = self.searcher._check_file_access(path)
         if err: self._show_temp_status(err); return
         try: subprocess.Popen(['xdg-open', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
@@ -1100,6 +1148,7 @@ class PhotoOrganizerWindow(QMainWindow):
         if folder:
             self.statusBar().showMessage(f"Indexing {folder}..."); self.progress_bar.setVisible(True); self.stop_index_btn.setVisible(True)
             self.progress_bar.setRange(0, 0); self.progress_bar.setFormat("Scanning...")
+            self._is_indexing = True
             self.index_worker = IndexWorker(self.searcher, folder); self.index_worker.progress.connect(self.indexing_progress)
             self.index_worker.result_ready.connect(self.indexing_finished); self.index_worker.finished.connect(self.index_worker.deleteLater); self.index_worker.start()
 
@@ -1108,11 +1157,27 @@ class PhotoOrganizerWindow(QMainWindow):
         self.progress_bar.setFormat(f"{msg} (%p%)"); self.statusBar().showMessage(msg)
 
     def indexing_finished(self, count: int, duration: float) -> None:
-        self.progress_bar.setVisible(False); self.stop_index_btn.setVisible(False); self.searcher.save_index_stats(duration, count); self.statusBar().showMessage(self._get_idle_status_message())
+        self.progress_bar.setVisible(False); self.stop_index_btn.setVisible(False)
+        self.searcher.save_index_stats(duration, count)
+        
+        self._is_indexing = False
+        
+        if self._pending_search_query:
+            query = self._pending_search_query
+            self._pending_search_query = None
+            self.start_search()
+        else:
+            self.statusBar().showMessage(self._get_idle_status_message())
 
     def start_search(self) -> None:
         query = self.search_input.text().strip()
         if not query: return
+        
+        if self._is_indexing:
+            self._pending_search_query = query
+            self.statusBar().showMessage("Indexing in progress. Search will execute automatically when finished...")
+            return
+
         self.list_widget.clear(); self._path_to_item.clear(); self.statusBar().showMessage("Searching...")
         if self.search_worker is not None:
             try: self.search_worker.result.disconnect(self.display_results)
@@ -1162,7 +1227,7 @@ class PhotoOrganizerWindow(QMainWindow):
         if selected_count > 1: self.statusBar().showMessage(f"{selected_count} items selected")
         else:
             path = current.data(Qt.ItemDataRole.UserRole)
-            err = self._check_file_access(path)
+            err = self.searcher._check_file_access(path)
             if err: self.statusBar().showMessage(f"{path}  |  {err}")
             else: self.statusBar().showMessage(f"{path}  |  Size: {self._format_file_size(path)}")
 
