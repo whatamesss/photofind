@@ -263,7 +263,7 @@ class PhotoSearch:
 
                 # Hard reserve 256MB for display server / allocator fragmentation / OS
                 # This prevents the caching allocator from expanding to 100% in nvtop
-                display_reserve = 256 * (1024**2)
+                display_reserve = 512 * (1024**2)
                 safe_available = max(free_vram - display_reserve, 0)
 
                 target_bs = int(safe_available / safe_bytes_per_img)
