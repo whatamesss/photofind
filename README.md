@@ -6,7 +6,7 @@ i welcome any contributions!
 The goal of photofind is to tame a massive, disorganized photo collection taken over the course of many years (or decades!). It provides a Google Photos-style visual search interface without relying on external cloud services or proprietary algorithms.
 
 ## Features
-*   **Semantic Visual Search:** Search your photos using natural language (e.g., "sunset at the beach," "cat sleeping on a sofa," "blue car with white stripe").
+*   **Semantic Visual Search:** Search your photos using natural language (e.g., "sunset at the beach," "cat sleeping on a sofa", "blue car with white stripe").
 *   **100% Local & Private:** No cloud uploads. All AI processing happens on your own CPU or GPU hardware.
 *   **Self-Optimizing Engine:** Automatically calibrates to your specific GPU VRAM and adjusts batch sizes dynamically to prevent crashes and maximize speed.
 *   **Hardware Acceleration:** Automatically detects and utilizes NVIDIA CUDA-capable GPUs.
@@ -22,6 +22,8 @@ Unlike traditional image recognition that requires specific training for every o
 ## Installation (Gentoo Linux)
 
 I've included an .ebuild so that you may add my repo to a local portage overlay.
+
+**NB: due to some of the dependencies not yet supporting 3.14 on gentoo, photofind is a python3.13 script
 
 Don't forget to run 'ebuild photofind-9999.ebuild manifest' in the overlay dir.
 and echo "media-gfx/photofind **" > /etc/portage/package.accept_keywords/photofind
