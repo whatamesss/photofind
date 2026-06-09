@@ -1,5 +1,11 @@
 #!/usr/bin/env python3.13
+"""
+PhotoFind: Semantic CLIP Image Search, Duplicate Detection, and Quality Sorting
+Requirements: torch, transformers, PyQt6, Pillow, jdupes (optional)
+"""
+
 import os
+# Configure CUDA memory allocator before importing torch
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import sys
@@ -17,11 +23,15 @@ import hashlib
 import tempfile
 import random
 import logging
+import warnings
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set, Tuple, Callable
 from PIL import Image, ImageOps
+
+# Transformers & PyTorch
 from transformers import CLIPProcessor, CLIPModel
 
+# PyQt6
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QListWidget, QListWidgetItem,
     QVBoxLayout, QWidget, QLineEdit, QLabel, QStatusBar,
@@ -29,14 +39,19 @@ from PyQt6.QtWidgets import (
     QMenu, QDialog, QAbstractItemView, QFrame, QProgressBar
 )
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QAction, QKeySequence, QShortcut, QDesktopServices
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint, QTimer, QLibraryInfo
 
+# Suppress SDPA warnings on older GPUs (e.g., GTX 1050Ti)
+warnings.filterwarnings("ignore", message="Torch was not compiled with memory efficient attention")
+warnings.filterwarnings("ignore", message="1Torch was not compiled with memory efficient attention")
+
+# --- Configuration ---
 SEARCH_FLOOR_MIN = 0.19
 SEARCH_FLOOR_RATIO = 0.55
 SEARCH_TOP_K = 60
 VRAM_TARGET_RATIO = 0.90
 MAX_BATCH_SIZE = 512
-VRAM_RESERVE_MB = 512  # Flat, configurable VRAM reserve
+VRAM_RESERVE_MB = 512
 
 _CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32).reshape(1, 1, 3)
 _CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32).reshape(1, 1, 3)
@@ -51,12 +66,37 @@ def format_duration(seconds: float) -> str:
     return f"{hours}h {mins}m"
 
 def open_in_file_browser(path: str) -> None:
-    kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """
+    Robust file opener that uses DBus to avoid Qt6.10 segfaults on KDE.
+    Keeps the 'Select File' functionality without crashing the desktop.
+    """
+    real_path = os.path.realpath(path)
+    file_uri = QUrl.fromLocalFile(real_path).toString()
+
+    # Try DBus first (Standard, stable, supports selection)
     try:
-        if os.path.exists("/usr/bin/dolphin"): subprocess.Popen(['dolphin', '--select', path], **kwargs)
-        elif os.path.exists("/usr/bin/nautilus"): subprocess.Popen(['nautilus', '--select', path], **kwargs)
-        else: subprocess.Popen(['xdg-open', os.path.dirname(path)], **kwargs)
-    except Exception: pass
+        import dbus
+        bus = dbus.SessionBus()
+        try:
+            # Standard FreeDesktop interface used by Dolphin/KDE
+            interface = dbus.Interface(
+                bus.get_object('org.freedesktop.FileManager1', '/org/freedesktop/FileManager1'),
+                'org.freedesktop.FileManager1'
+            )
+            # This calls Dolphin's DBus method directly.
+            interface.ShowItems([file_uri], "")
+            logging.info(f"Opened via DBus: {file_uri}")
+            return
+        except dbus.exceptions.DBusException:
+            pass
+    except ImportError:
+        pass
+
+    # Fallback: Use Qt's internal desktop services (Opens folder, no selection)
+    try:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(real_path)))
+    except Exception:
+        pass
 
 def _numpy_to_clip_arrays(img: Image.Image) -> Tuple[np.ndarray, float, float]:
     arr_uint8 = np.array(img)
@@ -71,6 +111,7 @@ def _numpy_to_clip_arrays(img: Image.Image) -> Tuple[np.ndarray, float, float]:
     arr = np.ascontiguousarray(arr.transpose(2, 0, 1))
     return arr, std_dev, edge_score
 
+# --- Core Search Engine ---
 
 class PhotoSearch:
     def __init__(self):
@@ -90,6 +131,30 @@ class PhotoSearch:
         self.model = self.model.to(self.device)
         if self.device == "cuda": self.model = self.model.half()
         self.model.eval()
+
+        # POWER MOVE: PyTorch 2.0 Compilation
+        # Checks GPU capability to avoid crashes on older cards (GTX 10xx).
+        can_compile = False
+        if hasattr(torch, "compile") and self.device == "cuda":
+            # FIX: get_device_capability() returns current device by default, or takes an int index, not a string.
+            cap_major, _ = torch.cuda.get_device_capability() 
+            if cap_major >= 7.0:
+                can_compile = True
+            else:
+                logging.info(f"Skipping torch.compile (GPU Compute Cap {cap_major}.x < 7.0). Triton requires newer hardware.")
+
+        if can_compile:
+            try:
+                logging.info("Compiling CLIP Vision Model with torch.compile (this may take a minute)...")
+                self.model.vision_model = torch.compile(
+                    self.model.vision_model, 
+                    mode="reduce-overhead",
+                    fullgraph=False
+                )
+                logging.info("Model compiled successfully.")
+            except Exception as e:
+                logging.warning(f"torch.compile failed (fallback to eager mode): {e}")
+
         self._cudnn_ok = None
         self.embedding_dim = self.model.config.projection_dim
         self._gpu_fully_oom = False
@@ -217,7 +282,7 @@ class PhotoSearch:
         gc.collect(); torch.cuda.empty_cache()
         free_vram, _ = torch.cuda.mem_get_info()
         
-        cap_major, _ = torch.cuda.get_device_capability(self.device)
+        cap_major, _ = torch.cuda.get_device_capability()
         force_cudnn_off = (cap_major < 7.0)
         
         logging.info(f"Calibrating batch size (free VRAM: {free_vram / (1024**2):.0f}MB, Compute Cap: {cap_major}.x)...")
@@ -634,6 +699,8 @@ class PhotoSearch:
                 if self._check_file_access(p) is None and not m.get('deleted') and self._is_garbage(m)]
 
 
+# --- Threading Workers ---
+
 class IndexWorker(QThread):
     progress = pyqtSignal(str, int, int); result_ready = pyqtSignal(int, float)
     def __init__(self, searcher: PhotoSearch, directory: str):
@@ -745,6 +812,8 @@ class DupesWorker(QThread):
             if not self._stop_requested: self.error.emit(f"Error: {str(e)}")
         finally: self._cleanup_temp_dir()
 
+
+# --- GUI Classes ---
 
 class DuplicateDialog(QDialog):
     _thumb_signal = pyqtSignal(str, bytes, int, int, int)
@@ -987,7 +1056,7 @@ class PhotoOrganizerWindow(QMainWindow):
         if self.searcher.load_index(): self.statusBar().showMessage(self._get_idle_status_message())
         else: self.statusBar().showMessage("Ready. No index loaded.")
 
-        sample_size = min(100, len(self.searcher.image_paths)); sample = random.sample(self.searcher.image_paths, sample_size)
+        sample_size = min(100, len(self.searcher.image_paths)); sample = random.sample(self.searcher.image_paths, sample_size) if self.searcher.image_paths else []
         missing = sum(1 for p in sample if not os.path.exists(p))
         if missing > 0: self.statusBar().showMessage(f"Warning: {missing}/{sample_size} sampled images missing. Consider 'Clean Database'.")
         else: self.statusBar().showMessage(self._get_idle_status_message())
@@ -1116,9 +1185,41 @@ class PhotoOrganizerWindow(QMainWindow):
     def open_image_viewer(self, path: str) -> None:
         err = self.searcher._check_file_access(path)
         if err: self._show_temp_status(err); return
-        try: subprocess.Popen(['xdg-open', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)): self._show_temp_status("Could not open image viewer.")
+
+        # DETECT BROKEN ENVIRONMENT
+        # If we are on the specific Qt version that crashes KIO, we bypass it.
+        qt_version = QLibraryInfo.version().toString()
+        is_broken_kde = (qt_version == "6.10.3")
+
+        if is_broken_kde:
+            # STRATEGY: Direct Launch
+            # Try common Linux image viewers in order of preference.
+            # This bypasses the Qt KIO worker crash.
+            viewers = [
+                'okular',      # KDE (Robust)
+                'loupe',       # Modern, fast (Rust)
+                'nomacs',      # Lightweight Qt
+                'feh',         # Very fast X11
+                'ristretto',   # XFCE
+                'eog',         # GNOME
+                'gwenview'     # KDE standard (User prefers others)
+            ]
+            
+            for viewer in viewers:
+                if shutil.which(viewer):
+                    try:
+                        subprocess.Popen([viewer, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        return
+                    except Exception:
+                        continue
+            
+            # If no direct viewer found, we have to use the system default and accept the crash risk
+            logging.warning("No common image viewer found. Falling back to system default (may crash).")
+        
+        # STRATEGY: Standard Qt (Only on Stable Qt versions)
+        # This respects your system preferences (like "Always open with X").
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            self._show_temp_status("Could not open image viewer.")
 
     def start_global_dedupe(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select Root Photo Folder to Scan")
@@ -1241,7 +1342,9 @@ if __name__ == "__main__":
     parser.add_argument("--find-garbage", action="store_true", help="Find low quality images")
     args, _ = parser.parse_known_args()
     cache_path = Path.home() / ".cache" / "photofind"
+    
     if args.index or args.search or args.find_garbage:
+        # CLI Mode
         searcher = PhotoSearch()
         if args.reindex:
             for p in [cache_path / "photo_index.json", cache_path / "photo_embeddings.pt", cache_path / "photo_metadata.json"]:
@@ -1255,8 +1358,10 @@ if __name__ == "__main__":
             hits = searcher.search(args.search, top_k=args.top); print(f"\nTop {args.top} results for '{args.search}':")
             for h in hits: print(f"[Score: {h['score']:.3f}] {h['file']}")
     else:
+        # GUI Mode
         app = QApplication(sys.argv)
         if args.reindex:
             for p in [cache_path / "photo_index.json", cache_path / "photo_embeddings.pt", cache_path / "photo_metadata.json"]:
                 if p.exists(): p.unlink()
-        window = PhotoOrganizerWindow(); window.show(); sys.exit(app.exec())
+        window = PhotoOrganizerWindow(); window.show()
+        sys.exit(app.exec())

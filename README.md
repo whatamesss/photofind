@@ -1,4 +1,5 @@
-# photofind is a complex python script written by robots but methodically designed and refined by myself! i welcome any contributions! 
+# photofind is a complex python script written by robots but methodically designed and refined by myself!
+i welcome any contributions! 
 
 **photofind** is a local, AI-powered photo search tool written in Python. It provides a graphical user interface (Qt6) to help you organize, search, and clean up massive photo collections using natural language.
 
@@ -35,11 +36,10 @@ echo "media-gfx/photofind jdupes" >> /etc/portage/package.use/photofind
 
 If you have an NVIDIA graphics card with CUDA capability, enable the `cuda` flag to the backend.
 
-echo "sci-libs/pytorch cuda" >> /etc/portage/package.use/photofind
 echo "sci-ml/caffe2 cuda" >> /etc/portage/package.use/photofind
 echo "dev-cpp/cutlass -clang-cuda" >> /etc/portage/package.use/photofind (i needed this one, ymmv)
 
-**Note:** This package requires `xdg-utils` to open images in your default external viewer.
+if your gpu has Compute Capability of 7.0 or higher, install 'networkx' for a speed-up.
 
 ## Usage
 
