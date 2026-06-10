@@ -37,7 +37,12 @@ S="${WORKDIR}/${P}"
 
 src_install() {
     python_newscript photofind.py photofind
-    make_desktop_entry "/usr/bin/photofind" "PhotoFind" "" "Graphics;Photography;"
+
+    insinto /usr/share/icons/hicolor/256x256/apps
+    doins photofind-256.png
+
+    make_desktop_entry "/usr/bin/photofind" "PhotoFind" "photofind" "Graphics;Photography;"
+
     einstalldocs
 }
 
