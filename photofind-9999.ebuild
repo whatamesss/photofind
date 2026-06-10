@@ -39,7 +39,7 @@ src_install() {
     python_newscript photofind.py photofind
 
     insinto /usr/share/icons/hicolor/256x256/apps
-    doins photofind-256.png
+    doins photofind.png photofind.png
 
     make_desktop_entry "/usr/bin/photofind" "PhotoFind" "photofind" "Graphics;Photography;"
 
