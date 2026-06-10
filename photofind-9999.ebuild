@@ -5,7 +5,7 @@ EAPI=8
 
 PYTHON_COMPAT=( python3_13 )
 DISTUTILS_USE_PEP517=setuptools
-inherit git-r3 python-single-r1 desktop
+inherit git-r3 python-single-r1 desktop xdg
 
 DESCRIPTION="Local AI-powered photo search and organizer using CLIP and PyQt6"
 HOMEPAGE="https://github.com/whatamesss/photofind"
@@ -47,6 +47,8 @@ src_install() {
 }
 
 pkg_postinst() {
+    xdg_icon_cache_update
+
     if [[ ! ${REPLACING_VERSIONS} ]]; then
         elog "PhotoFind has been installed."
         elog "On first run, the application will download the 'openai/clip-vit-large-patch14' model."
@@ -54,4 +56,8 @@ pkg_postinst() {
             elog "The 'jdupes' USE flag is disabled. Duplicate detection is disabled."
         fi
     fi
+}
+
+pkg_postrm() {
+    xdg_icon_cache_update
 }
