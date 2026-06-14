@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python
 """
 PhotoFind: Semantic CLIP Image Search, Duplicate Detection, and Quality Sorting
 Requirements: torch, transformers, PyQt6, Pillow, jdupes (optional)
