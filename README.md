@@ -23,8 +23,6 @@ Unlike traditional image recognition that requires specific training for every o
 
 I've included an .ebuild so that you may add my repo to a local portage overlay.
 
-**NB: due to some of the dependencies not yet supporting 3.14 on gentoo, photofind is a python3.13 script
-
 Don't forget to run 'ebuild photofind-9999.ebuild manifest' in the overlay dir.
 and echo "media-gfx/photofind **" > /etc/portage/package.accept_keywords/photofind
 
@@ -38,6 +36,7 @@ echo "media-gfx/photofind jdupes" >> /etc/portage/package.use/photofind
 
 If you have an NVIDIA graphics card with CUDA capability, enable the `cuda` flag to the backend.
 
+echo "sci-ml/pytorch cuda" >> /etc/portage/package.use/pytorch
 echo "sci-ml/caffe2 cuda" >> /etc/portage/package.use/photofind
 echo "dev-cpp/cutlass -clang-cuda" >> /etc/portage/package.use/photofind (i needed this one, ymmv)
 
