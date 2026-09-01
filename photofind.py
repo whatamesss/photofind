@@ -119,12 +119,12 @@ class PhotoSearch:
         logging.info(f"Loading CLIP model on {self.device}...")
         model_id = "openai/clip-vit-large-patch14"
         try:
-            self.processor = CLIPProcessor.from_pretrained(model_id, use_fast=True, local_files_only=True)
+            self.processor = CLIPProcessor.from_pretrained(model_id, backend="torchvision", local_files_only=True)
             self.model = CLIPModel.from_pretrained(model_id, local_files_only=True)
             logging.info("Model loaded successfully (Offline).")
         except OSError:
             logging.warning("Model files not found in cache. Downloading...")
-            self.processor = CLIPProcessor.from_pretrained(model_id, use_fast=True)
+            self.processor = CLIPProcessor.from_pretrained(model_id, backend="torchvision")
             self.model = CLIPModel.from_pretrained(model_id)
             logging.info("Download complete.")
 
