@@ -130,7 +130,12 @@ class PhotoSearch:
             logging.info("Download complete.")
 
         self.model = self.model.to(self.device)
-        if self.device == "cuda": self.model = self.model.half()
+        self._use_fp16 = False
+        if self.device == "cuda":
+            cap_major, _ = torch.cuda.get_device_capability()
+            self._use_fp16 = (cap_major >= 6)
+            if self._use_fp16: self.model = self.model.half()
+            logging.info(f"Compute precision: {'fp16' if self._use_fp16 else 'fp32'} (compute capability {cap_major}.x)")
         self.model.eval()
 
         # POWER MOVE: PyTorch 2.0 Compilation
@@ -172,6 +177,12 @@ class PhotoSearch:
         self.embeddings_file = self.cache_dir / "photo_embeddings.pt"
         self.metadata_file = self.cache_dir / "photo_metadata.json"
         self.stats_file = self.cache_dir / "stats.json"
+        self.excluded_file = self.cache_dir / "excluded_dirs.json"
+        self.excluded_dirs: Set[str] = set()
+        try:
+            if self.excluded_file.exists():
+                with open(self.excluded_file, "r") as f: self.excluded_dirs = set(json.load(f))
+        except Exception: self.excluded_dirs = set()
 
         self.image_paths, self.image_embeddings, self.image_metadata, self.indexed_set = [], None, {}, set()
         self.stats = self._load_stats()
@@ -455,16 +466,21 @@ class PhotoSearch:
         return False
 
     def _ensure_model_on_cpu(self) -> None:
-        with self._model_lock: self.model.vision_model.float().to('cpu'); self.model.visual_projection.float().to('cpu')
+        with self._model_lock:
+            if self._use_fp16: self.model.vision_model.float().to('cpu'); self.model.visual_projection.float().to('cpu')
+            else: self.model.vision_model.to('cpu'); self.model.visual_projection.to('cpu')
         if self.device == "cuda": torch.cuda.empty_cache()
 
     def _ensure_model_on_gpu(self) -> None:
-        with self._model_lock: self.model.vision_model.half().to(self.device); self.model.visual_projection.half().to(self.device)
+        with self._model_lock:
+            if self._use_fp16: self.model.vision_model.half().to(self.device); self.model.visual_projection.half().to(self.device)
+            else: self.model.vision_model.to(self.device); self.model.visual_projection.to(self.device)
         if self.device == "cuda": torch.cuda.empty_cache()
 
     def index_photos(self, source_dir: str, progress_callback: Optional[Callable[[str, int, int], None]] = None,
                      cancel_check: Optional[Callable[[], bool]] = None) -> None:
         self._release_gpu_embeddings()
+        self._ips_last_t, self._ips_ema = None, 0.0
         source_path = os.path.realpath(source_dir); extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
         logging.info(f"Scanning {source_path} for images..."); files = []
         for root, dirs, filenames in os.walk(source_path):
@@ -472,7 +488,8 @@ class PhotoSearch:
                 logging.info("Indexing cancelled."); gc.collect();
                 if self.device == "cuda": torch.cuda.empty_cache()
                 return
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            dirs[:] = [d for d in dirs if not d.startswith('.') and not self._dir_excluded(os.path.join(root, d))]
+            if self._dir_excluded(root): continue
             for filename in filenames:
                 if Path(filename).suffix.lower() in extensions: files.append(os.path.join(root, filename))
         with self._lock:
@@ -566,7 +583,16 @@ class PhotoSearch:
                 new_embeddings.append(features); new_paths.extend(batch_map); new_metadata.extend(batch_meta)
                 del pv, features; processed_count += batch_size_actual
                 if progress_callback:
-                    progress_callback(f"Indexing... {processed_count}/{total_files} (BS: {self.current_batch_size})", processed_count, total_files)
+                    now = time.time()
+                    rate_str = ""
+                    if self._ips_last_t is not None:
+                        dt = now - self._ips_last_t
+                        if dt > 0.05:
+                            inst = batch_size_actual / dt
+                            self._ips_ema = inst if self._ips_ema == 0.0 else 0.8 * self._ips_ema + 0.2 * inst
+                            rate_str = f", {self._ips_ema:.1f} img/s"
+                    self._ips_last_t = now
+                    progress_callback(f"Indexing... {processed_count}/{total_files} (BS: {self.current_batch_size}{rate_str})", processed_count, total_files)
             except RuntimeError as e:
                 err_str = str(e).lower()
                 if "out of memory" in err_str or "unable to find an engine" in err_str:
@@ -822,6 +848,45 @@ class PhotoSearch:
         with self._lock:
             if file_path in self.image_metadata: self.image_metadata[file_path]['deleted'] = True
             with open(self.metadata_file, "w", errors='surrogateescape') as f: json.dump(self.image_metadata, f)
+
+    def _dir_excluded(self, dir_path: str) -> bool:
+        if not self.excluded_dirs: return False
+        rp = os.path.realpath(dir_path)
+        return any(rp == x or rp.startswith(x + os.sep) for x in self.excluded_dirs)
+
+    def exclude_directory(self, directory: str) -> int:
+        """Exclude a directory and everything under it: removes its indexed
+        entries now and skips it in all future indexing. Returns removed count."""
+        rp = os.path.realpath(directory); prefix = rp + os.sep
+        self.excluded_dirs.add(rp)
+        try:
+            with open(self.excluded_file, "w") as f: json.dump(sorted(self.excluded_dirs), f)
+        except Exception: pass
+        with self._lock:
+            keep_indices = [i for i, p in enumerate(self.image_paths) if not p.startswith(prefix)]
+            removed = len(self.image_paths) - len(keep_indices)
+            if removed == 0: return 0
+            self.image_paths = [self.image_paths[i] for i in keep_indices]
+            self.indexed_set = set(self.image_paths)
+            for p in [p for p in self.image_metadata if p.startswith(prefix)]: self.image_metadata.pop(p, None)
+            if self.image_embeddings is not None:
+                self.image_embeddings = self.image_embeddings[keep_indices].contiguous() if keep_indices else None
+            self._embeddings_dirty = True
+            temp_emb, temp_idx, temp_meta = str(self.embeddings_file)+".tmp", str(self.index_file)+".tmp", str(self.metadata_file)+".tmp"
+            try:
+                if self.image_embeddings is not None: torch.save(self.image_embeddings, temp_emb)
+                with open(temp_idx, "w", errors='surrogateescape') as f: json.dump(self.image_paths, f)
+                with open(temp_meta, "w", errors='surrogateescape') as f: json.dump(self.image_metadata, f)
+                if self.image_embeddings is not None: os.replace(temp_emb, str(self.embeddings_file))
+                elif self.embeddings_file.exists(): os.remove(self.embeddings_file)
+                os.replace(temp_idx, str(self.index_file)); os.replace(temp_meta, str(self.metadata_file))
+            except Exception:
+                for tmp in (temp_emb, temp_idx, temp_meta):
+                    try:
+                        if os.path.exists(tmp): os.remove(tmp)
+                    except OSError: pass
+                raise
+        return removed
 
     def _get_embeddings_gpu(self) -> torch.Tensor:
         with self._lock:
@@ -1405,6 +1470,7 @@ class PhotoOrganizerWindow(QMainWindow):
             path = selected_items[0].data(Qt.ItemDataRole.UserRole)
             menu.addAction("Open in Image Viewer").triggered.connect(lambda: self.open_image_viewer(path))
             menu.addAction("Open in File Browser").triggered.connect(lambda: open_in_file_browser(path))
+            menu.addAction("Exclude Parent Folder from Index").triggered.connect(lambda: self.exclude_parent_folder(path))
             menu.addSeparator()
         delete_action = menu.addAction(f"Move {selected_count} Photos to Trash" if selected_count > 1 else "Move to Trash")
         delete_action.triggered.connect(lambda: self.delete_photos_action([i.data(Qt.ItemDataRole.UserRole) for i in selected_items], selected_items))
@@ -1422,6 +1488,20 @@ class PhotoOrganizerWindow(QMainWindow):
             for item in reversed([i for i in items if i.data(Qt.ItemDataRole.UserRole) in success]): self.list_widget.takeItem(self.list_widget.row(item))
             if fail: QMessageBox.warning(self, "Error", f"Could not move {len(fail)} files to trash.")
             else: self._show_temp_status(f"Moved {count} photos to Trash.")
+
+    def exclude_parent_folder(self, path: str) -> None:
+        folder = os.path.dirname(os.path.realpath(path))
+        count = sum(1 for p in self.searcher.image_paths if p.startswith(folder + os.sep))
+        msg = (f"Exclude this folder from the index?\n\n{folder}\n\n"
+               f"{count} indexed photo(s) will be removed now. Future indexing will skip "
+               f"this folder and all its subfolders.")
+        if QMessageBox.question(self, 'Exclude Folder', msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            try:
+                removed = self.searcher.exclude_directory(folder)
+                self.list_widget.clear(); self._path_to_item.clear(); self.current_results = []
+                self._show_temp_status(f"Excluded {folder}. Removed {removed} indexed photos.")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to exclude folder: {e}")
 
     def open_image_viewer(self, path: str) -> None:
         err = self.searcher._check_file_access(path)
