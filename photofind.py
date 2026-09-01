@@ -906,8 +906,7 @@ class PhotoSearch:
         if os.path.exists(path): return None
         p, existing_parent = Path(path), Path(path)
         while not existing_parent.exists() and existing_parent != Path('/'): existing_parent = existing_parent.parent
-        str_parent = str(existing_parent)
-        if '/media/' in str_parent or '/mnt/' in str_parent or '/run/media/' in str_parent: return f"Filesystem {existing_parent} not available, please mount"
+        if any(existing_parent.is_relative_to(m) for m in ('/run/media', '/media', '/mnt')): return f"Filesystem {existing_parent} not available, please mount"
         return "File not found"
 
     def search(self, query: str, top_k: int = SEARCH_TOP_K) -> List[Dict[str, Any]]:
