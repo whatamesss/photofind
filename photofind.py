@@ -251,9 +251,15 @@ class PhotoSearch:
             else: img.load()
             img = img.resize((224, 224), Image.Resampling.BILINEAR)
             arr, std_dev, edge_score = _numpy_to_clip_arrays(img)
+
             img.close()
-            return arr, os.path.realpath(file_path), {"std_dev": std_dev, "edge_score": edge_score}
-        except Exception: return None, None, None
+
+            return arr, os.path.realpath(file_path), {
+                "std_dev": std_dev,
+                "edge_score": edge_score,
+            }
+
+        except Exception as e: logging.warning(f"Failed to load image {file_path}: {type(e).__name__}: {e}"); return None, None, None
 
     def _release_gpu_embeddings(self) -> None:
         with self._lock:
@@ -345,7 +351,7 @@ class PhotoSearch:
                 err_str = str(e).lower()
                 if "unable to find an engine" in err_str or "out of memory" in err_str:
                     logging.warning(f"cuDNN={'ON' if try_cudnn else 'OFF'} failed: {e}")
-                    if dummy_pv is not None: del dummy_pv
+                    probe_pv = None          # was: if dummy_pv is not None: del dummy_pv
                     torch.cuda.empty_cache()
                     if not try_cudnn or force_cudnn_off:
                         logging.warning("GPU calibration failed entirely. Using CPU fallback.")
@@ -690,7 +696,8 @@ class PhotoSearch:
 
     def _is_garbage(self, meta: Dict[str, Any]) -> bool:
         std_dev, edge_score = meta.get("std_dev", 100.0), meta.get("edge_score")
-        if edge_score is None: return std_dev < 25.0
+        if edge_score is None:
+            return std_dev < 25.0
         return std_dev < 8.0 or (std_dev < 25.0 and edge_score < 12.0)
 
     def get_garbage_photos(self) -> List[Dict[str, Any]]:
@@ -1300,11 +1307,22 @@ class PhotoOrganizerWindow(QMainWindow):
         self.statusBar().showMessage(f"Found {len(hits)} results. Loading thumbnails..."); paths_to_load = []
         for hit in hits:
             path, score = hit['file'], hit.get('score', 0.0); item = QListWidgetItem(); item.setData(Qt.ItemDataRole.UserRole, path); item.setSizeHint(QSize(200, 200))
+
             if hit.get('is_garbage'):
                 meta = self.searcher.image_metadata.get(path, {})
-                tooltip = f"{os.path.basename(path)}\nSize: {self._format_file_size(path)}\n[LOW QUALITY] std_dev={meta.get('std_dev', 0.0):.1f}, edge_score={meta.get('edge_score', 0.0):.1f}"
-            else: tooltip = f"{os.path.basename(path)}\nSize: {self._format_file_size(path)}\nScore: {score:.3f}"
-            item.setToolTip(tooltip); self.list_widget.addItem(item); self._path_to_item[path] = item; paths_to_load.append(path)
+                tooltip = (
+                    f"{os.path.basename(path)}\n"
+                    f"Size: {self._format_file_size(path)}\n"
+                    f"[LOW QUALITY] std_dev={meta.get('std_dev', 0.0):.1f}, edge_score={meta.get('edge_score', 0.0):.1f}"
+                )
+            else:
+                tooltip = f"{os.path.basename(path)}\nSize: {self._format_file_size(path)}\nScore: {score:.3f}"
+
+            item.setToolTip(tooltip)
+            self.list_widget.addItem(item)
+            self._path_to_item[path] = item
+            paths_to_load.append(path)
+
         try:
             if self.thumb_worker and self.thumb_worker.isRunning(): self.thumb_worker.cancel(); self.thumb_worker.wait(500)
         except RuntimeError: pass
