@@ -769,6 +769,7 @@ class PhotoSearch:
         )
 
         with self._lock:
+            backup = (self.image_paths, self.indexed_set, self.image_embeddings, dict(self.image_metadata), self._embeddings_dirty)
             self.image_paths = valid_paths
             self.indexed_set = set(valid_paths)
 
@@ -840,6 +841,7 @@ class PhotoSearch:
                     except OSError:
                         pass
 
+                self.image_paths, self.indexed_set, self.image_embeddings, self.image_metadata, self._embeddings_dirty = backup
                 raise
 
         return removed_count
@@ -863,6 +865,7 @@ class PhotoSearch:
             with open(self.excluded_file, "w") as f: json.dump(sorted(self.excluded_dirs), f)
         except Exception: pass
         with self._lock:
+            backup = (self.image_paths, self.indexed_set, self.image_embeddings, dict(self.image_metadata), self._embeddings_dirty)
             keep_indices = [i for i, p in enumerate(self.image_paths) if not p.startswith(prefix)]
             removed = len(self.image_paths) - len(keep_indices)
             if removed == 0: return 0
@@ -885,6 +888,7 @@ class PhotoSearch:
                     try:
                         if os.path.exists(tmp): os.remove(tmp)
                     except OSError: pass
+                self.image_paths, self.indexed_set, self.image_embeddings, self.image_metadata, self._embeddings_dirty = backup
                 raise
         return removed
 
