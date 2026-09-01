@@ -201,23 +201,101 @@ class PhotoSearch:
         except Exception: pass
 
     def load_index(self) -> bool:
-        if self.index_file.exists() and self.embeddings_file.exists():
-            try:
-                with open(self.index_file, "r", errors='surrogateescape') as f: raw_paths = json.load(f)
-                self.image_paths = raw_paths
-                loaded_embeddings = torch.load(str(self.embeddings_file), map_location='cpu', weights_only=False)
-                if loaded_embeddings.shape[1] != self.embedding_dim:
-                    logging.warning("Incompatible index dimension. Please re-index."); return False
-                if self.device == "cuda": loaded_embeddings = loaded_embeddings.half()
-                self.image_embeddings, self.indexed_set = loaded_embeddings, set(raw_paths)
-                if self.metadata_file.exists():
-                    with open(self.metadata_file, "r", errors='surrogateescape') as f: self.image_metadata = json.load(f)
-                else: self.image_metadata = {}
-                for p in self.image_paths:
-                    if p not in self.image_metadata: self.image_metadata[p] = {"std_dev": 50.0, "edge_score": 50.0}
-                self._embeddings_dirty = True
-                logging.info(f"Loaded {len(self.image_paths)} image embeddings."); return True
-            except Exception as e: logging.error(f"Error loading index: {e}")
+        if not self.index_file.exists() or not self.embeddings_file.exists():
+            return False
+
+        try:
+            with open(
+                self.index_file,
+                "r",
+                errors="surrogateescape"
+            ) as f:
+                raw_paths = json.load(f)
+
+            if not isinstance(raw_paths, list):
+                raise ValueError("Index paths are not a list")
+
+            loaded_embeddings = torch.load(
+                str(self.embeddings_file),
+                map_location="cpu",
+                weights_only=True,
+            )
+
+            if not isinstance(loaded_embeddings, torch.Tensor):
+                raise ValueError(
+                    "Embedding index does not contain a Tensor"
+                )
+
+            if loaded_embeddings.ndim != 2:
+                raise ValueError(
+                    f"Embedding index must be 2-D, "
+                    f"got {loaded_embeddings.ndim}-D"
+                )
+
+            if loaded_embeddings.shape[1] != self.embedding_dim:
+                logging.warning(
+                    "Incompatible index dimension: "
+                    f"{loaded_embeddings.shape[1]} "
+                    f"(expected {self.embedding_dim}). "
+                    "Please re-index."
+                )
+                return False
+
+            if loaded_embeddings.shape[0] != len(raw_paths):
+                raise ValueError(
+                    "Corrupt index: "
+                    f"{len(raw_paths)} paths but "
+                    f"{loaded_embeddings.shape[0]} embeddings"
+                )
+
+            if self.device == "cuda":
+                loaded_embeddings = loaded_embeddings.half()
+            else:
+                loaded_embeddings = loaded_embeddings.float()
+
+            self.image_paths = raw_paths
+            self.image_embeddings = loaded_embeddings
+            self.indexed_set = set(raw_paths)
+
+            if self.metadata_file.exists():
+                with open(
+                    self.metadata_file,
+                    "r",
+                    errors="surrogateescape"
+                ) as f:
+                    self.image_metadata = json.load(f)
+
+                if not isinstance(self.image_metadata, dict):
+                    raise ValueError(
+                        "Metadata index is not a dictionary"
+                    )
+            else:
+                self.image_metadata = {}
+
+            for p in self.image_paths:
+                if p not in self.image_metadata:
+                    self.image_metadata[p] = {
+                        "std_dev": 50.0,
+                        "edge_score": 50.0
+                    }
+
+            self._embeddings_dirty = True
+
+            logging.info(
+                f"Loaded {len(self.image_paths)} image embeddings."
+            )
+            return True
+
+        except Exception as e:
+            logging.error(
+                f"Error loading index: {type(e).__name__}: {e}"
+            )
+
+            self.image_paths = []
+            self.image_embeddings = None
+            self.image_metadata = {}
+            self.indexed_set = set()
+
         return False
 
     def _get_thumb_lock(self, path: str) -> threading.Lock:
@@ -250,7 +328,7 @@ class PhotoSearch:
             if min(w, h) < 32 or max(w, h) < 64: return None, None, None
             if img.mode != "RGB": img = img.convert("RGB")
             else: img.load()
-            img = img.resize((224, 224), Image.Resampling.BILINEAR)
+            img = ImageOps.fit(img, (224, 224), Image.Resampling.BICUBIC)
             arr, std_dev, edge_score, mean_lum, lap_var, lum_p95, lap_p95 = _numpy_to_clip_arrays(img)
 
             img.close()
@@ -377,11 +455,11 @@ class PhotoSearch:
         return False
 
     def _ensure_model_on_cpu(self) -> None:
-        with self._model_lock: self.model.vision_model.to('cpu'); self.model.visual_projection.to('cpu')
+        with self._model_lock: self.model.vision_model.float().to('cpu'); self.model.visual_projection.float().to('cpu')
         if self.device == "cuda": torch.cuda.empty_cache()
 
     def _ensure_model_on_gpu(self) -> None:
-        with self._model_lock: self.model.vision_model.to(self.device); self.model.visual_projection.to(self.device)
+        with self._model_lock: self.model.vision_model.half().to(self.device); self.model.visual_projection.half().to(self.device)
         if self.device == "cuda": torch.cuda.empty_cache()
 
     def index_photos(self, source_dir: str, progress_callback: Optional[Callable[[str, int, int], None]] = None,
@@ -574,52 +652,170 @@ class PhotoSearch:
             logging.info("Indexing complete.")
         else: logging.info("No valid images processed.")
 
-    def clean_database(self, progress_callback: Optional[Callable[[str], None]] = None) -> int:
-        if not self.image_paths: return 0
-        valid_paths, valid_indices, removed_count = [], [], 0
+    def clean_database(
+        self,
+        progress_callback: Optional[Callable[[str], None]] = None
+    ) -> int:
+        if not self.image_paths:
+            return 0
+
+        valid_paths = []
+        valid_indices = []
+        removed_count = 0
+
         dir_map: Dict[str, List[int]] = {}
+
         for i, path in enumerate(self.image_paths):
-            d = os.path.dirname(path)
-            if d not in dir_map: dir_map[d] = []
-            dir_map[d].append(i)
-            
+            directory = os.path.dirname(path)
+            dir_map.setdefault(directory, []).append(i)
+
         total_dirs = len(dir_map)
-        for dir_idx, (directory, indices) in enumerate(dir_map.items()):
-            if progress_callback and dir_idx % 500 == 0: 
-                progress_callback(f"Verifying directories... {dir_idx}/{total_dirs}")
-                
+
+        for dir_idx, (directory, indices) in enumerate(
+            dir_map.items()
+        ):
+            if progress_callback and dir_idx % 500 == 0:
+                progress_callback(
+                    f"Verifying directories... "
+                    f"{dir_idx}/{total_dirs}"
+                )
+
+            # A directory which genuinely disappeared can safely have
+            # its indexed entries removed.
             if not os.path.exists(directory):
+                access_err = self._check_file_access(directory)
+                if access_err and "not available" in access_err:
+                    logging.warning(
+                        f"Directory {directory!r} is on an unavailable "
+                        f"filesystem; keeping {len(indices)} entries."
+                    )
+                    valid_paths.extend(self.image_paths[i] for i in indices)
+                    valid_indices.extend(indices)
+                    continue
                 removed_count += len(indices)
+
                 for i in indices:
                     p = self.image_paths[i]
-                    if p in self.image_metadata: del self.image_metadata[p]
-            else:
-                try:
-                    actual_files = set(os.listdir(directory))
-                except PermissionError:
-                    actual_files = set()
-                    
-                for i in indices:
-                    filename = os.path.basename(self.image_paths[i])
-                    if filename in actual_files:
-                        valid_paths.append(self.image_paths[i])
-                        valid_indices.append(i)
-                    else:
-                        removed_count += 1
-                        p = self.image_paths[i]
-                        if p in self.image_metadata: del self.image_metadata[p]
+                    self.image_metadata.pop(p, None)
 
-        if removed_count > 0:
-            logging.info(f"Cleaning database: Removing {removed_count} missing files.")
-            with self._lock:
-                self.image_paths, self.indexed_set = valid_paths, set(valid_paths)
+                continue
+
+            try:
+                actual_files = set(os.listdir(directory))
+
+            except (PermissionError, OSError) as e:
+                # IMPORTANT:
+                # Inaccessible does NOT mean empty.
+                #
+                # Keep all entries because we cannot determine whether
+                # the files are actually missing.
+                logging.warning(
+                    f"Cannot inspect directory {directory!r}: "
+                    f"{type(e).__name__}: {e}. "
+                    f"Keeping {len(indices)} indexed entries."
+                )
+
+                valid_paths.extend(
+                    self.image_paths[i]
+                    for i in indices
+                )
+                valid_indices.extend(indices)
+                continue
+
+            for i in indices:
+                path = self.image_paths[i]
+                filename = os.path.basename(path)
+
+                if filename in actual_files:
+                    valid_paths.append(path)
+                    valid_indices.append(i)
+
+                else:
+                    removed_count += 1
+                    self.image_metadata.pop(path, None)
+
+        if removed_count <= 0:
+            return 0
+
+        logging.info(
+            f"Cleaning database: Removing "
+            f"{removed_count} missing files."
+        )
+
+        with self._lock:
+            self.image_paths = valid_paths
+            self.indexed_set = set(valid_paths)
+
+            if self.image_embeddings is not None:
+                if valid_indices:
+                    self.image_embeddings = (
+                        self.image_embeddings[valid_indices]
+                        .contiguous()
+                    )
+                else:
+                    self.image_embeddings = None
+
+            self._embeddings_dirty = True
+
+            # Write temporary files first so a failed write doesn't leave
+            # a partially-written JSON file.
+            temp_emb = str(self.embeddings_file) + ".tmp"
+            temp_idx = str(self.index_file) + ".tmp"
+            temp_meta = str(self.metadata_file) + ".tmp"
+
+            try:
                 if self.image_embeddings is not None:
-                    self.image_embeddings = self.image_embeddings[valid_indices] if valid_indices else None
-                self._embeddings_dirty = True
-                if self.image_embeddings is not None: torch.save(self.image_embeddings, str(self.embeddings_file))
-                elif self.embeddings_file.exists(): os.remove(self.embeddings_file)
-                with open(self.index_file, "w", errors='surrogateescape') as f: json.dump(self.image_paths, f)
-                with open(self.metadata_file, "w", errors='surrogateescape') as f: json.dump(self.image_metadata, f)
+                    torch.save(
+                        self.image_embeddings,
+                        temp_emb
+                    )
+
+                with open(
+                    temp_idx,
+                    "w",
+                    errors="surrogateescape"
+                ) as f:
+                    json.dump(self.image_paths, f)
+
+                with open(
+                    temp_meta,
+                    "w",
+                    errors="surrogateescape"
+                ) as f:
+                    json.dump(self.image_metadata, f)
+
+                if self.image_embeddings is not None:
+                    os.replace(
+                        temp_emb,
+                        str(self.embeddings_file)
+                    )
+                elif self.embeddings_file.exists():
+                    os.remove(self.embeddings_file)
+
+                os.replace(
+                    temp_idx,
+                    str(self.index_file)
+                )
+
+                os.replace(
+                    temp_meta,
+                    str(self.metadata_file)
+                )
+
+            except Exception:
+                for tmp in (
+                    temp_emb,
+                    temp_idx,
+                    temp_meta,
+                ):
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except OSError:
+                        pass
+
+                raise
+
         return removed_count
 
     def mark_photo_deleted(self, file_path: str) -> None:
@@ -739,10 +935,27 @@ class IndexWorker(QThread):
 
 class SearchWorker(QThread):
     result = pyqtSignal(list)
-    def __init__(self, searcher: PhotoSearch, query: str): super().__init__(); self.searcher, self.query = searcher, query
+
+    def __init__(
+        self,
+        searcher: PhotoSearch,
+        query: str
+    ):
+        super().__init__()
+        self.searcher = searcher
+        self.query = query
+
     def run(self):
-        try: self.result.emit(self.searcher.search(self.query))
-        except Exception: self.result.emit([])
+        try:
+            self.result.emit(
+                self.searcher.search(self.query)
+            )
+        except Exception as e:
+            logging.exception(
+                f"Search failed for query {self.query!r}: "
+                f"{type(e).__name__}: {e}"
+            )
+            self.result.emit([])
 
 
 class GarbageWorker(QThread):
@@ -818,17 +1031,22 @@ class DupesWorker(QThread):
             if self._stop_requested: self._cleanup_temp_dir(); self.cancelled.emit(); return
             if self.process.returncode == 2: self._cleanup_temp_dir(); self.error.emit(f"jdupes error (code {self.process.returncode})"); return
             stdout = stdout_bytes.decode('utf-8', errors='surrogateescape'); groups, current_group = [], []
+            total_dupe_files = 0
             for line in stdout.splitlines():
                 if line.strip() == "":
-                    if len(current_group) > 1: groups.append(current_group)
+                    if len(current_group) > 1:
+                        groups.append(current_group)
+                        total_dupe_files += len(current_group)
                     if len(groups) >= 50: self.chunk_ready.emit(groups); groups = []
                     current_group = []
                 else:
                     real_path = link_to_real.get(line.strip())
                     if real_path and real_path in self.indexed_set: current_group.append(real_path)
-            if len(current_group) > 1: groups.append(current_group)
+            if len(current_group) > 1:
+                groups.append(current_group)
+                total_dupe_files += len(current_group)
             if groups: self.chunk_ready.emit(groups)
-            self.scan_complete.emit(time.time() - start_time, sum(len(g) for g in groups))
+            self.scan_complete.emit(time.time() - start_time, total_dupe_files)
         except FileNotFoundError: self.error.emit("'jdupes' is not installed.")
         except Exception as e:
             if not self._stop_requested: self.error.emit(f"Error: {str(e)}")
@@ -909,6 +1127,7 @@ class DuplicateDialog(QDialog):
 
     def stream_finished(self, duration: float, total_dupes: int) -> None:
         self.is_streaming = False; self.stop_scan_btn.setVisible(False); self.update_next_button_state()
+        if not self.group_list.count() and self.all_groups: self.page_offset = 0; self.render_current_page()
         dur_str = format_duration(duration); count = len(self.all_groups)
         self.setWindowTitle(f"Duplicate Manager ({count} Total Sets Found)")
         self.info_label.setText(f"Scan complete ({dur_str}). Found {count} duplicate sets ({total_dupes} total files)." if count else f"Scan complete ({dur_str}). No duplicates found.")
@@ -1288,7 +1507,7 @@ class PhotoOrganizerWindow(QMainWindow):
         if self._pending_search_query:
             query = self._pending_search_query
             self._pending_search_query = None
-            self.start_search()
+            self.search_input.setText(query); self.start_search()
         else:
             self.statusBar().showMessage(self._get_idle_status_message())
 
@@ -1335,7 +1554,7 @@ class PhotoOrganizerWindow(QMainWindow):
                 tooltip = (
                     f"{os.path.basename(path)}\n"
                     f"Size: {self._format_file_size(path)}\n"
-                    f"[LOW QUALITY] std_dev={meta.get('std_dev', 0.0):.1f}, edge_score={meta.get('edge_score', 0.0):.1f}"
+                    f"[BADNESS {score:.2f}] lum_p95={meta.get('lum_p95', -1):.1f}, lap_p95={meta.get('lap_p95', -1):.1f}"
                 )
             else:
                 tooltip = f"{os.path.basename(path)}\nSize: {self._format_file_size(path)}\nScore: {score:.3f}"
