@@ -105,11 +105,12 @@ def _numpy_to_clip_arrays(img: Image.Image) -> Tuple[np.ndarray, float, float]:
     dx = np.abs(gray[:, 2:] - gray[:, :-2])
     dy = np.abs(gray[2:, :] - gray[:-2, :])
     edge_score = float(np.mean(dx) + np.mean(dy))
+    mean_lum = float(gray.mean()); lap = (-4.0 * gray[1:-1, 1:-1] + gray[:-2, 1:-1] + gray[2:, 1:-1] + gray[1:-1, :-2] + gray[1:-1, 2:]); lap_var = float(lap.var()); lum_p95 = float(np.percentile(gray, 95)); lap_p95 = float(np.percentile(np.abs(lap), 95))
     # CPU float32 math (optimal for overlapping PCIe transfer)
     arr = arr_uint8.astype(np.float32) / 255.0
     arr = (arr - _CLIP_MEAN) / _CLIP_STD
     arr = np.ascontiguousarray(arr.transpose(2, 0, 1))
-    return arr, std_dev, edge_score
+    return arr, std_dev, edge_score, mean_lum, lap_var, lum_p95, lap_p95
 
 # --- Core Search Engine ---
 
@@ -250,13 +251,13 @@ class PhotoSearch:
             if img.mode != "RGB": img = img.convert("RGB")
             else: img.load()
             img = img.resize((224, 224), Image.Resampling.BILINEAR)
-            arr, std_dev, edge_score = _numpy_to_clip_arrays(img)
+            arr, std_dev, edge_score, mean_lum, lap_var, lum_p95, lap_p95 = _numpy_to_clip_arrays(img)
 
             img.close()
 
             return arr, os.path.realpath(file_path), {
                 "std_dev": std_dev,
-                "edge_score": edge_score,
+                "edge_score": edge_score, "mean_lum": mean_lum, "lap_var": lap_var, "lum_p95": lum_p95, "lap_p95": lap_p95,
             }
 
         except Exception as e: logging.warning(f"Failed to load image {file_path}: {type(e).__name__}: {e}"); return None, None, None
@@ -694,16 +695,30 @@ class PhotoSearch:
             
         return results
 
-    def _is_garbage(self, meta: Dict[str, Any]) -> bool:
-        std_dev, edge_score = meta.get("std_dev", 100.0), meta.get("edge_score")
-        if edge_score is None:
-            return std_dev < 25.0
-        return std_dev < 8.0 or (std_dev < 25.0 and edge_score < 12.0)
+    def _badness(self, meta: Dict[str, Any]) -> float:
+        """Badness in [0, 2]: 0 = healthy; near-black and/or blurry raises it."""
+        lum_p95, lap_p95 = meta.get("lum_p95"), meta.get("lap_p95")
+        if lum_p95 is None or lap_p95 is None: return 0.0
+        dark = max(0.0, min(1.0, (25.0 - lum_p95) / 25.0))
+        blur = max(0.0, min(1.0, (12.0 - lap_p95) / 10.0))
+        return dark + blur
 
-    def get_garbage_photos(self) -> List[Dict[str, Any]]:
-        return [{"file": p, "score": 0.0, "is_garbage": True}
-                for p, m in self.image_metadata.items()
-                if self._check_file_access(p) is None and not m.get('deleted') and self._is_garbage(m)]
+    def _is_garbage(self, meta: Dict[str, Any]) -> bool:
+        return self._badness(meta) >= 1.5
+
+    def get_garbage_photos(self, offset: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
+        """Worst photos by badness score, highest first; window [offset, offset+limit)."""
+        scored = sorted(((self._badness(m), p) for p, m in self.image_metadata.items()
+                         if not m.get('deleted')), reverse=True)
+        total = sum(1 for s, _ in scored if s > 0.0)
+        if total: offset %= total
+        out = []
+        for s, p in scored:
+            if len(out) >= limit or s <= 0.0: break
+            if offset > 0: offset -= 1; continue
+            if self._check_file_access(p) is None:
+                out.append({"file": p, "score": round(s, 2), "is_garbage": True})
+        return out
 
 
 # --- Threading Workers ---
@@ -733,7 +748,7 @@ class SearchWorker(QThread):
 class GarbageWorker(QThread):
     result = pyqtSignal(list)
     def __init__(self, searcher: PhotoSearch): super().__init__(); self.searcher = searcher
-    def run(self): self.result.emit(self.searcher.get_garbage_photos())
+    def run(self): self.result.emit(self.searcher.get_garbage_photos(getattr(self.searcher, "_garbage_offset", 0)))
 
 
 class CleanWorker(QThread):
@@ -1098,9 +1113,9 @@ class PhotoOrganizerWindow(QMainWindow):
     def setup_ui(self) -> None:
         central_widget = QWidget(); self.setCentralWidget(central_widget); layout = QVBoxLayout(central_widget); search_layout = QHBoxLayout()
         self.search_input = QLineEdit(); self.search_input.setPlaceholderText("Type a description..."); self.search_input.returnPressed.connect(self.start_search)
-        search_btn = QPushButton("Search"); search_btn.clicked.connect(self.start_search); garbage_btn = QPushButton("Find Bad Photos"); garbage_btn.clicked.connect(self.find_garbage)
-        garbage_btn.setToolTip("Find images with low variance/edges (std_dev < 25, edge_score < 12)")
-        search_layout.addWidget(self.search_input); search_layout.addWidget(search_btn); search_layout.addWidget(garbage_btn); layout.addLayout(search_layout)
+        search_btn = QPushButton("Search"); search_btn.clicked.connect(self.start_search); self.garbage_btn = QPushButton("Find 50 Bad Photos"); self.garbage_btn.clicked.connect(self.next_garbage_page)
+        self.garbage_btn.setToolTip("Worst 50 photos by badness (darkness + blur). Click again for the next 50.")
+        search_layout.addWidget(self.search_input); search_layout.addWidget(search_btn); search_layout.addWidget(self.garbage_btn); layout.addLayout(search_layout)
         bottom_layout = QHBoxLayout(); self.progress_bar = QProgressBar(); self.progress_bar.setVisible(False); self.progress_bar.setTextVisible(True)
         self.stop_index_btn = QPushButton("Stop Indexing"); self.stop_index_btn.setVisible(False); self.stop_index_btn.clicked.connect(self.cancel_current_operation)
         bottom_layout.addWidget(self.progress_bar, 1); bottom_layout.addWidget(self.stop_index_btn, 0); layout.addLayout(bottom_layout)
@@ -1292,6 +1307,13 @@ class PhotoOrganizerWindow(QMainWindow):
             except (RuntimeError, TypeError): pass
         self.search_worker = SearchWorker(self.searcher, query); self.search_worker.result.connect(self.display_results)
         self.search_worker.finished.connect(self.search_worker.deleteLater); self.search_worker.start()
+
+    def next_garbage_page(self) -> None:
+        page = getattr(self, "_garbage_page", 0)
+        self.searcher._garbage_offset = page * 50
+        self._garbage_page = page + 1
+        self.find_garbage()
+        self.garbage_btn.setText("Find 50 More Bad Photos")
 
     def find_garbage(self) -> None:
         self.list_widget.clear(); self._path_to_item.clear(); self.statusBar().showMessage("Scanning metadata for bad photos...")
