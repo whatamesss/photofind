@@ -44,6 +44,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint, QT
 # Suppress SDPA warnings on older GPUs (e.g., GTX 1050Ti)
 warnings.filterwarnings("ignore", message="Torch was not compiled with memory efficient attention")
 warnings.filterwarnings("ignore", message="1Torch was not compiled with memory efficient attention")
+warnings.filterwarnings("ignore", category=UserWarning, module="PIL.Image")
 
 # --- Configuration ---
 SEARCH_FLOOR_MIN = 0.19
@@ -337,6 +338,7 @@ class PhotoSearch:
         try:
             img = Image.open(file_path); img = ImageOps.exif_transpose(img); w, h = img.size
             if min(w, h) < 32 or max(w, h) < 64: return None, None, None
+            if w * h > 89_478_485: logging.warning(f"Large image ({w}x{h}, {w*h/1e6:.0f}MP), indexing anyway: {file_path}")
             if img.mode != "RGB": img = img.convert("RGB")
             else: img.load()
             img = ImageOps.fit(img, (224, 224), Image.Resampling.BICUBIC)
@@ -688,6 +690,7 @@ class PhotoSearch:
         valid_paths = []
         valid_indices = []
         removed_count = 0
+        new_metadata = dict(self.image_metadata)
 
         dir_map: Dict[str, List[int]] = {}
 
@@ -722,7 +725,7 @@ class PhotoSearch:
 
                 for i in indices:
                     p = self.image_paths[i]
-                    self.image_metadata.pop(p, None)
+                    new_metadata.pop(p, None)
 
                 continue
 
@@ -758,7 +761,7 @@ class PhotoSearch:
 
                 else:
                     removed_count += 1
-                    self.image_metadata.pop(path, None)
+                    new_metadata.pop(path, None)
 
         if removed_count <= 0:
             return 0
@@ -772,6 +775,7 @@ class PhotoSearch:
             backup = (self.image_paths, self.indexed_set, self.image_embeddings, dict(self.image_metadata), self._embeddings_dirty)
             self.image_paths = valid_paths
             self.indexed_set = set(valid_paths)
+            self.image_metadata = new_metadata
 
             if self.image_embeddings is not None:
                 if valid_indices:
