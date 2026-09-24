@@ -381,11 +381,10 @@ class PhotoSearch:
         free_vram, _ = torch.cuda.mem_get_info()
         
         cap_major, _ = torch.cuda.get_device_capability()
-        force_cudnn_off = (cap_major < 7.0)
         
         logging.info(f"Calibrating batch size (free VRAM: {free_vram / (1024**2):.0f}MB, Compute Cap: {cap_major}.x)...")
 
-        probe_sequence = [False] if force_cudnn_off else [True, False]
+        probe_sequence = [True, False]
 
         for try_cudnn in probe_sequence:
             torch.backends.cudnn.enabled = try_cudnn
