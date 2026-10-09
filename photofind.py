@@ -47,9 +47,11 @@ warnings.filterwarnings("ignore", message="1Torch was not compiled with memory e
 warnings.filterwarnings("ignore", category=UserWarning, module="PIL.Image")
 
 # --- Configuration ---
-SEARCH_FLOOR_MIN = 0.19
-SEARCH_FLOOR_RATIO = 0.55
+SEARCH_FLOOR_MIN = 0.15
+SEARCH_FLOOR_RATIO = 0.45
 SEARCH_TOP_K = 60
+SEARCH_DEDUPE_COS = 0.99
+INDEX_EXCLUDE_FRAGMENTS = ("/www.", "/html/", "/textures/", "/res/", "nopic", "/screenshots/", "/downloads/", "/cache/", "/tmp/", "cake_wallet")
 VRAM_TARGET_RATIO = 0.90
 MAX_BATCH_SIZE = 512
 VRAM_RESERVE_MB = 512
@@ -99,7 +101,7 @@ def open_in_file_browser(path: str) -> None:
     except Exception:
         pass
 
-def _numpy_to_clip_arrays(img: Image.Image) -> Tuple[np.ndarray, float, float]:
+def _numpy_to_clip_arrays(img: Image.Image) -> Tuple[np.ndarray, float, float, float, float, float, float]:
     arr_uint8 = np.array(img)
     gray = arr_uint8.mean(axis=2).astype(np.float32)
     std_dev = float(np.std(gray))
@@ -186,6 +188,7 @@ class PhotoSearch:
         except Exception: self.excluded_dirs = set()
 
         self.image_paths, self.image_embeddings, self.image_metadata, self.indexed_set = [], None, {}, set()
+        self.last_search_warnings: List[str] = []
         self.stats = self._load_stats()
         self._lock = threading.Lock()
         self._model_lock = threading.RLock()
@@ -442,9 +445,11 @@ class PhotoSearch:
                 err_str = str(e).lower()
                 if "unable to find an engine" in err_str or "out of memory" in err_str:
                     logging.warning(f"cuDNN={'ON' if try_cudnn else 'OFF'} failed: {e}")
-                    probe_pv = None          # was: if dummy_pv is not None: del dummy_pv
+                    if dummy_pv is not None:
+                        del dummy_pv
+                        dummy_pv = None
                     torch.cuda.empty_cache()
-                    if not try_cudnn or force_cudnn_off:
+                    if not try_cudnn:
                         logging.warning("GPU calibration failed entirely. Using CPU fallback.")
                         self._cudnn_ok = False; self._gpu_fully_oom = True; return 16
                     logging.info("Disabling cuDNN (not supported on this GPU)...")
@@ -489,10 +494,13 @@ class PhotoSearch:
                 logging.info("Indexing cancelled."); gc.collect();
                 if self.device == "cuda": torch.cuda.empty_cache()
                 return
-            dirs[:] = [d for d in dirs if not d.startswith('.') and not self._dir_excluded(os.path.join(root, d))]
-            if self._dir_excluded(root): continue
+            dirs[:] = [d for d in dirs if not d.startswith('.') and not self._dir_excluded(os.path.join(root, d))
+                       and not self._fragment_skipped(os.path.join(root, d))]
+            if self._dir_excluded(root) or self._fragment_skipped(root): continue
             for filename in filenames:
-                if Path(filename).suffix.lower() in extensions: files.append(os.path.join(root, filename))
+                fpath = os.path.join(root, filename)
+                if Path(filename).suffix.lower() in extensions and not self._fragment_skipped(fpath):
+                    files.append(fpath)
         with self._lock:
             if self.indexed_set:
                 initial_count = len(files); files = [f for f in files if f not in self.indexed_set]
@@ -850,14 +858,25 @@ class PhotoSearch:
         return removed_count
 
     def mark_photo_deleted(self, file_path: str) -> None:
+        self.mark_photos_deleted([file_path])
+
+    def mark_photos_deleted(self, file_paths: List[str]) -> None:
         with self._lock:
-            if file_path in self.image_metadata: self.image_metadata[file_path]['deleted'] = True
-            with open(self.metadata_file, "w", errors='surrogateescape') as f: json.dump(self.image_metadata, f)
+            changed = False
+            for fp in file_paths:
+                if fp in self.image_metadata:
+                    self.image_metadata[fp]['deleted'] = True; changed = True
+            if changed:
+                with open(self.metadata_file, "w", errors='surrogateescape') as f: json.dump(self.image_metadata, f)
 
     def _dir_excluded(self, dir_path: str) -> bool:
         if not self.excluded_dirs: return False
         rp = os.path.realpath(dir_path)
         return any(rp == x or rp.startswith(x + os.sep) for x in self.excluded_dirs)
+
+    def _fragment_skipped(self, path: str) -> bool:
+        if not INDEX_EXCLUDE_FRAGMENTS: return False
+        return any(fragment in os.path.realpath(path).lower() for fragment in INDEX_EXCLUDE_FRAGMENTS)
 
     def exclude_directory(self, directory: str) -> int:
         """Exclude a directory and everything under it: removes its indexed
@@ -875,6 +894,37 @@ class PhotoSearch:
             self.image_paths = [self.image_paths[i] for i in keep_indices]
             self.indexed_set = set(self.image_paths)
             for p in [p for p in self.image_metadata if p.startswith(prefix)]: self.image_metadata.pop(p, None)
+            if self.image_embeddings is not None:
+                self.image_embeddings = self.image_embeddings[keep_indices].contiguous() if keep_indices else None
+            self._embeddings_dirty = True
+            temp_emb, temp_idx, temp_meta = str(self.embeddings_file)+".tmp", str(self.index_file)+".tmp", str(self.metadata_file)+".tmp"
+            try:
+                if self.image_embeddings is not None: torch.save(self.image_embeddings, temp_emb)
+                with open(temp_idx, "w", errors='surrogateescape') as f: json.dump(self.image_paths, f)
+                with open(temp_meta, "w", errors='surrogateescape') as f: json.dump(self.image_metadata, f)
+                if self.image_embeddings is not None: os.replace(temp_emb, str(self.embeddings_file))
+                elif self.embeddings_file.exists(): os.remove(self.embeddings_file)
+                os.replace(temp_idx, str(self.index_file)); os.replace(temp_meta, str(self.metadata_file))
+            except Exception:
+                for tmp in (temp_emb, temp_idx, temp_meta):
+                    try:
+                        if os.path.exists(tmp): os.remove(tmp)
+                    except OSError: pass
+                self.image_paths, self.indexed_set, self.image_embeddings, self.image_metadata, self._embeddings_dirty = backup
+                raise
+        return removed
+
+    def purge_fragment_entries(self) -> int:
+        """Remove already-indexed entries matching INDEX_EXCLUDE_FRAGMENTS."""
+        if not INDEX_EXCLUDE_FRAGMENTS: return 0
+        with self._lock:
+            keep_indices = [i for i, p in enumerate(self.image_paths) if not self._fragment_skipped(p)]
+            removed = len(self.image_paths) - len(keep_indices)
+            if removed == 0: return 0
+            backup = (self.image_paths, self.indexed_set, self.image_embeddings, dict(self.image_metadata), self._embeddings_dirty)
+            self.image_paths = [self.image_paths[i] for i in keep_indices]
+            self.indexed_set = set(self.image_paths)
+            for p in [p for p in self.image_metadata if self._fragment_skipped(p)]: self.image_metadata.pop(p, None)
             if self.image_embeddings is not None:
                 self.image_embeddings = self.image_embeddings[keep_indices].contiguous() if keep_indices else None
             self._embeddings_dirty = True
@@ -934,9 +984,10 @@ class PhotoSearch:
         with torch.no_grad():
             embeddings = self._get_embeddings_gpu()
             similarities = torch.mm(embeddings, text_features.T).squeeze().float()
-            requested_k = min(top_k * 10, len(similarities))
+            requested_k = min(max(top_k * 40, 1000), len(similarities))
             values, indices = torch.topk(similarities, requested_k)
 
+        cand = embeddings[indices].float().cpu()
         scores_np = values.cpu().numpy()
         idxs_np = indices.cpu().numpy()
         
@@ -944,6 +995,10 @@ class PhotoSearch:
         
         effective_floor = max(SEARCH_FLOOR_MIN, float(scores_np[0]) * SEARCH_FLOOR_RATIO)
         results = []
+        accepted_refs: List[torch.Tensor] = []
+        skipped_dup = 0
+        unmounted: Set[str] = set()
+        self.last_search_warnings = []
         
         for i in range(len(scores_np)):
             score = float(scores_np[i])
@@ -954,12 +1009,27 @@ class PhotoSearch:
             
             meta = self.image_metadata.get(fp)
             if meta and meta.get('deleted'): continue
-            if meta and self._is_garbage(meta): continue
-            if not os.path.exists(fp): continue
-                
+            if meta and self._is_black(meta): continue
+            err = self._check_file_access(fp)
+            if err is not None:
+                if "not available" in err: unmounted.add(err)
+                continue
+            
+            vec = cand[i]
+            if accepted_refs:
+                if bool((vec @ torch.stack(accepted_refs).t() > SEARCH_DEDUPE_COS).any()):
+                    skipped_dup += 1
+                    continue
+            accepted_refs.append(vec)
             results.append({"file": fp, "score": score})
             if len(results) >= top_k: break
             
+        if skipped_dup:
+            logging.info(f"Search dedup: skipped {skipped_dup} near-duplicate photos.")
+        if unmounted:
+            self.last_search_warnings = sorted(unmounted)
+            for w in self.last_search_warnings:
+                logging.warning(f"Search skipped results: {w}")
         return results
 
     def _badness(self, meta: Dict[str, Any]) -> float:
@@ -972,6 +1042,11 @@ class PhotoSearch:
 
     def _is_garbage(self, meta: Dict[str, Any]) -> bool:
         return self._badness(meta) >= 1.5
+
+    def _is_black(self, meta: Dict[str, Any]) -> bool:
+        """Near-black frame: 95th-percentile luminance <= 10/255."""
+        lum_p95 = meta.get("lum_p95")
+        return lum_p95 is not None and lum_p95 <= 10.0
 
     def get_garbage_photos(self, offset: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
         """Worst photos by badness score, highest first; window [offset, offset+limit)."""
@@ -1005,7 +1080,7 @@ class IndexWorker(QThread):
 
 
 class SearchWorker(QThread):
-    result = pyqtSignal(list)
+    result = pyqtSignal(list, list)
 
     def __init__(
         self,
@@ -1018,15 +1093,14 @@ class SearchWorker(QThread):
 
     def run(self):
         try:
-            self.result.emit(
-                self.searcher.search(self.query)
-            )
+            hits = self.searcher.search(self.query)
+            self.result.emit(hits, list(self.searcher.last_search_warnings))
         except Exception as e:
             logging.exception(
                 f"Search failed for query {self.query!r}: "
                 f"{type(e).__name__}: {e}"
             )
-            self.result.emit([])
+            self.result.emit([], [])
 
 
 class GarbageWorker(QThread):
@@ -1297,8 +1371,9 @@ class DuplicateDialog(QDialog):
     def _delete_paths(self, paths_to_delete: List[str], items_to_remove: List[QListWidgetItem]) -> None:
         success_paths = []; fail_paths = []
         for p in paths_to_delete:
-            if QFile.moveToTrash(p): self.searcher.mark_photo_deleted(p); success_paths.append(p)
+            if QFile.moveToTrash(p): success_paths.append(p)
             else: fail_paths.append(p)
+        if success_paths: self.searcher.mark_photos_deleted(success_paths)
         for p in success_paths: self.purge_file_from_all_groups(p)
         if fail_paths: QMessageBox.warning(self, "Error", f"Could not trash {len(fail_paths)} files.")
 
@@ -1489,8 +1564,9 @@ class PhotoOrganizerWindow(QMainWindow):
         if QMessageBox.question(self, 'Move to Trash', msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
             success, fail = [], []
             for p in paths:
-                if QFile.moveToTrash(p): self.searcher.mark_photo_deleted(p); success.append(p)
+                if QFile.moveToTrash(p): success.append(p)
                 else: fail.append(p)
+            if success: self.searcher.mark_photos_deleted(success)
             for item in reversed([i for i in items if i.data(Qt.ItemDataRole.UserRole) in success]): self.list_widget.takeItem(self.list_widget.row(item))
             if fail: QMessageBox.warning(self, "Error", f"Could not move {len(fail)} files to trash.")
             else: self._show_temp_status(f"Moved {count} photos to Trash.")
@@ -1628,10 +1704,12 @@ class PhotoOrganizerWindow(QMainWindow):
         self.garbage_worker = GarbageWorker(self.searcher); self.garbage_worker.result.connect(self.display_results)
         self.garbage_worker.finished.connect(self.garbage_worker.deleteLater); self.garbage_worker.start()
 
-    def display_results(self, hits: List[Dict[str, Any]]) -> None:
+    def display_results(self, hits: List[Dict[str, Any]], warnings: Optional[List[str]] = None) -> None:
         self.list_widget.clear(); self._path_to_item.clear(); self.current_results = hits
-        if not hits: self._show_temp_status("No results found."); return
-        self.statusBar().showMessage(f"Found {len(hits)} results. Loading thumbnails..."); paths_to_load = []
+        warn_suffix = f" Warning: {'; '.join(warnings)}" if warnings else ""
+        if not hits:
+            self._show_temp_status(f"No results found.{warn_suffix}" if warnings else "No results found."); return
+        self.statusBar().showMessage(f"Found {len(hits)} results. Loading thumbnails...{warn_suffix}"); paths_to_load = []
         for hit in hits:
             path, score = hit['file'], hit.get('score', 0.0); item = QListWidgetItem(); item.setData(Qt.ItemDataRole.UserRole, path); item.setSizeHint(QSize(200, 200))
 
@@ -1654,7 +1732,7 @@ class PhotoOrganizerWindow(QMainWindow):
             if self.thumb_worker and self.thumb_worker.isRunning(): self.thumb_worker.cancel(); self.thumb_worker.wait(500)
         except RuntimeError: pass
         self.thumb_worker = ThumbnailWorker(paths_to_load, self.searcher); self.thumb_worker.thumbnail_loaded.connect(self.update_thumbnail)
-        self.thumb_worker.finished.connect(lambda: self.statusBar().showMessage(self._get_idle_status_message()))
+        self.thumb_worker.finished.connect(lambda: self.statusBar().showMessage(self._get_idle_status_message() + warn_suffix))
         self.thumb_worker.finished.connect(self.thumb_worker.deleteLater); self.thumb_worker.start()
 
     def update_thumbnail(self, path: str, data: bytes, w: int, h: int, bpl: int) -> None:
@@ -1685,10 +1763,11 @@ if __name__ == "__main__":
     parser.add_argument("--index", type=str, help="Directory to index"); parser.add_argument("--search", type=str, help="Search query")
     parser.add_argument("--reindex", action="store_true", help="Clear index"); parser.add_argument("--top", type=int, default=5, help="Results count")
     parser.add_argument("--find-garbage", action="store_true", help="Find low quality images")
+    parser.add_argument("--purge-junk", action="store_true", help="Remove non-photo directory entries from index")
     args, _ = parser.parse_known_args()
     cache_path = Path.home() / ".cache" / "photofind"
     
-    if args.index or args.search or args.find_garbage:
+    if args.index or args.search or args.find_garbage or args.purge_junk:
         # CLI Mode
         searcher = PhotoSearch()
         if args.reindex:
@@ -1696,6 +1775,9 @@ if __name__ == "__main__":
                 if p.exists(): p.unlink()
         searcher.load_index()
         if args.index: searcher.index_photos(args.index)
+        elif args.purge_junk:
+            removed = searcher.purge_fragment_entries()
+            print(f"Removed {removed} entries matching {INDEX_EXCLUDE_FRAGMENTS}. New index size: {len(searcher.image_paths)}")
         elif args.find_garbage:
             hits = searcher.get_garbage_photos(); print(f"\nFound {len(hits)} low quality images:")
             for h in hits: print(f"[Garbage] {h['file']}")
