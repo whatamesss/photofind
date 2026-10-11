@@ -21,10 +21,13 @@ Unlike traditional image recognition that requires specific training for every o
 
 ## Installation (Gentoo Linux)
 
-I've included an .ebuild so that you may add my repo to a local portage overlay.
+I've included an .ebuild (at media-gfx/photofind/) so that you may add my repo to a local portage overlay.
 
-Don't forget to run 'ebuild photofind-9999.ebuild manifest' in the overlay dir.
-and echo "media-gfx/photofind **" > /etc/portage/package.accept_keywords/photofind
+The package directory needs a Manifest file. Since this is a live (-9999) ebuild with no distfiles, it is empty; generate it once with:
+
+ebuild photofind-9999.ebuild manifest
+
+echo "media-gfx/photofind **" > /etc/portage/package.accept_keywords/photofind
 
 You must explicitly enable the `torch` backend for the Hugging Face libraries.
 

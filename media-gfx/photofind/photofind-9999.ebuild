@@ -15,6 +15,7 @@ LICENSE="GPL-3+"
 SLOT="0"
 KEYWORDS=""
 IUSE="jdupes"
+PROPERTIES="live"
 
 REQUIRED_USE="${PYTHON_REQUIRED_USE}"
 
@@ -46,13 +47,16 @@ src_install() {
 	insinto /usr/share/icons/hicolor/256x256/apps
 	doins photofind.png
 
+	insinto /usr/share/icons/hicolor/48x48/apps
+	doins photofind-48.png
+
 	make_desktop_entry \
 		photofind \
 		PhotoFind \
 		photofind \
 		"Graphics;Photography;"
 
-	einstalldocs
+	dodoc README.md LICENSE
 }
 
 pkg_postinst() {
