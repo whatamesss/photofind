@@ -42,7 +42,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QToolBar, QHBoxLayout, QPushButton,
     QMenu, QDialog, QAbstractItemView, QFrame, QProgressBar,
     QToolButton, QTabWidget, QDoubleSpinBox, QSpinBox, QFormLayout,
-    QGroupBox, QDialogButtonBox, QInputDialog
+    QGroupBox, QDialogButtonBox
 )
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QAction, QKeySequence, QShortcut, QDesktopServices
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint, QTimer, QLibraryInfo, QLoggingCategory
@@ -1993,6 +1993,94 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+class FolderExcludeDialog(QDialog):
+    """Pick which folder along a photo's path to exclude from the index.
+
+    Shows every ancestor folder (with how many indexed photos each would remove)
+    so the user can choose, e.g., `~/music` rather than only the file's folder.
+    A "Browse..." button also allows excluding any other folder.
+    """
+
+    def __init__(self, searcher: PhotoSearch, start_dir: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.searcher = searcher
+        self.start_dir = os.path.realpath(start_dir)
+        self.chosen: Optional[str] = None
+        self.setWindowTitle("Exclude Folder from Index"); self.resize(640, 460)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel("Choose the folder to exclude \u2014 it and all of its subfolders "
+                      "will be removed from the index and skipped when indexing.")
+        hint.setWordWrap(True); layout.addWidget(hint)
+
+        self.list = QListWidget(); layout.addWidget(self.list)
+        self.info = QLabel("\u2014"); self.info.setWordWrap(True)
+        self.info.setFrameStyle(QFrame.Shape.Panel | QFrame.Shadow.Sunken); self.info.setMargin(4)
+        layout.addWidget(self.info)
+
+        btns = QDialogButtonBox()
+        self.browse_btn = btns.addButton("Browse\u2026", QDialogButtonBox.ButtonRole.ActionRole)
+        self.exclude_btn = btns.addButton("Exclude", QDialogButtonBox.ButtonRole.AcceptRole)
+        cancel_btn = btns.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        layout.addWidget(btns)
+
+        self._populate()
+        self.list.currentItemChanged.connect(self._update_info)
+        self.list.itemDoubleClicked.connect(lambda *_: self._accept())
+        self.exclude_btn.clicked.connect(self._accept)
+        self.browse_btn.clicked.connect(self._browse)
+        cancel_btn.clicked.connect(self.reject)
+
+    def _indexed_count_under(self, folder: str) -> int:
+        prefix = folder.rstrip(os.sep) + os.sep
+        return sum(1 for p in self.searcher.image_paths if p.startswith(prefix))
+
+    def _populate(self) -> None:
+        # Ancestors from filesystem root down to the photo's own folder, so the
+        # list reads like the path and the wanted folder is easy to spot.
+        chain, node = [], Path(self.start_dir)
+        while True:
+            chain.append(node)
+            if node.parent == node: break
+            node = node.parent
+        chain.reverse()
+        for anc in chain:
+            folder = str(anc)
+            if anc == Path(self.start_dir):
+                label = os.path.basename(folder) or folder
+                label = f"{label}   (this file's folder)"
+            else:
+                label = os.path.basename(folder) or folder
+            count = self._indexed_count_under(folder)
+            item = QListWidgetItem(f"{label}    \u2014  {count} indexed photo{'' if count == 1 else 's'}")
+            item.setData(Qt.ItemDataRole.UserRole, folder)
+            item.setToolTip(folder)
+            self.list.addItem(item)
+        if self.list.count():
+            self.list.setCurrentRow(self.list.count() - 1)
+
+    def _update_info(self, *_args: Any) -> None:
+        item = self.list.currentItem()
+        if item is None:
+            self.info.setText("\u2014"); self.exclude_btn.setEnabled(False); return
+        folder = item.data(Qt.ItemDataRole.UserRole)
+        count = self._indexed_count_under(folder)
+        self.info.setText(f"Exclude: {folder}\n{count} indexed photo(s) would be removed.")
+        self.exclude_btn.setEnabled(True)
+
+    def _accept(self) -> None:
+        item = self.list.currentItem()
+        if item is None: return
+        self.chosen = item.data(Qt.ItemDataRole.UserRole)
+        self.accept()
+
+    def _browse(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Choose folder to exclude", self.start_dir)
+        if folder:
+            self.chosen = os.path.realpath(folder)
+            self.accept()
+
+
 class PhotoOrganizerWindow(QMainWindow):
     preview_results = pyqtSignal(int, float)
 
@@ -2158,28 +2246,12 @@ class PhotoOrganizerWindow(QMainWindow):
         return sum(1 for p in self.searcher.image_paths if p.startswith(prefix))
 
     def exclude_folder_dialog(self, path: str) -> None:
-        """Let the user pick which ancestor folder to exclude (e.g. ~/music),
-        not just the file's immediate parent."""
-        start = Path(os.path.realpath(path)).parent
-        ancestors = []
-        node = start
-        while True:
-            ancestors.append(node)
-            if node.parent == node: break
-            node = node.parent
-        labels, folders = [], []
-        for anc in ancestors:
-            folder = str(anc)
-            count = self._indexed_count_under(folder)
-            labels.append(f"{folder}    ({count} indexed photo{'' if count == 1 else 's'})")
-            folders.append(folder)
-        if not folders: return
-        choice, ok = QInputDialog.getItem(
-            self, "Exclude Folder from Index",
-            "Choose the folder to exclude (its subfolders are excluded too):",
-            labels, 0, False)
-        if not ok or not choice: return
-        folder = folders[labels.index(choice)]
+        """Let the user pick which folder along the photo's path to exclude
+        (e.g. ~/music), not just the file's immediate parent."""
+        start = os.path.dirname(os.path.realpath(path))
+        dialog = FolderExcludeDialog(self.searcher, start, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.chosen: return
+        folder = dialog.chosen
         count = self._indexed_count_under(folder)
         msg = (f"Exclude this folder from the index?\n\n{folder}\n\n"
                f"{count} indexed photo(s) will be removed now. Future indexing will skip "
