@@ -36,7 +36,9 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QListWidget, QListWidgetItem,
     QVBoxLayout, QWidget, QLineEdit, QLabel, QStatusBar,
     QFileDialog, QMessageBox, QToolBar, QHBoxLayout, QPushButton,
-    QMenu, QDialog, QAbstractItemView, QFrame, QProgressBar
+    QMenu, QDialog, QAbstractItemView, QFrame, QProgressBar,
+    QToolButton, QTabWidget, QDoubleSpinBox, QSpinBox, QFormLayout,
+    QGroupBox, QDialogButtonBox
 )
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QAction, QKeySequence, QShortcut, QDesktopServices
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint, QTimer, QLibraryInfo
@@ -47,10 +49,28 @@ warnings.filterwarnings("ignore", message="1Torch was not compiled with memory e
 warnings.filterwarnings("ignore", category=UserWarning, module="PIL.Image")
 
 # --- Configuration ---
-SEARCH_FLOOR_MIN = 0.15
-SEARCH_FLOOR_RATIO = 0.45
-SEARCH_TOP_K = 60
-SEARCH_DEDUPE_COS = 0.99
+# Default search-accuracy and quality thresholds. Editable at runtime via the
+# "Search Tuning" dialog and persisted to ~/.cache/photofind/settings.json.
+DEFAULT_SEARCH_SETTINGS: Dict[str, Any] = {
+    "top_k": 60,            # max results returned
+    "floor_min": 0.15,      # absolute cosine-similarity floor
+    "floor_ratio": 0.45,    # required fraction of the best hit's score
+    "dedupe_cos": 0.99,     # suppress results more similar than this to a kept hit
+    "candidate_mult": 40,   # candidate pool multiplier (advanced)
+    "black_lum_p95": 10.0,  # hide near-black photos at/below this luminance
+}
+
+DEFAULT_QUALITY_SETTINGS: Dict[str, Any] = {
+    "dark_lum_p95": 25.0, "dark_span": 25.0,
+    "blur_lap_p95": 12.0, "blur_span": 10.0,
+    "over_lum_p95": 235.0, "over_lum_span": 20.0,
+    "over_mean_lum": 200.0, "over_mean_span": 55.0,
+    "folder_mirror_coverage": 0.90,
+}
+
+# Directories that are poor places to "keep" a duplicate copy from.
+DUPE_JUNK_FRAGMENTS = ("/downloads/", "/tmp/", "/cache/", "/trash/", "/.trash")
+
 INDEX_EXCLUDE_FRAGMENTS = ("/www.", "/html/", "/textures/", "/res/", "nopic", "/screenshots/", "/downloads/", "/cache/", "/tmp/", "cake_wallet")
 VRAM_TARGET_RATIO = 0.90
 MAX_BATCH_SIZE = 512
@@ -187,6 +207,11 @@ class PhotoSearch:
                 with open(self.excluded_file, "r") as f: self.excluded_dirs = set(json.load(f))
         except Exception: self.excluded_dirs = set()
 
+        self.settings_file = self.cache_dir / "settings.json"
+        self.search_settings: Dict[str, Any] = dict(DEFAULT_SEARCH_SETTINGS)
+        self.quality_settings: Dict[str, Any] = dict(DEFAULT_QUALITY_SETTINGS)
+        self._load_settings()
+
         self.image_paths, self.image_embeddings, self.image_metadata, self.indexed_set = [], None, {}, set()
         self.last_search_warnings: List[str] = []
         self.stats = self._load_stats()
@@ -194,6 +219,32 @@ class PhotoSearch:
         self._model_lock = threading.RLock()
         self._embeddings_on_gpu, self._embeddings_device, self._embeddings_dirty = None, 'cpu', True
         self.current_batch_size, self.batch_size_lock = 32, threading.Lock()
+        self._dir_counts: Optional[Dict[str, int]] = None
+
+    def _load_settings(self) -> None:
+        """Merge persisted settings over the built-in defaults."""
+        try:
+            if self.settings_file.exists():
+                with open(self.settings_file, "r") as f: data = json.load(f)
+                for k, v in (data.get("search") or {}).items():
+                    if k in self.search_settings: self.search_settings[k] = v
+                for k, v in (data.get("quality") or {}).items():
+                    if k in self.quality_settings: self.quality_settings[k] = v
+        except Exception as e:
+            logging.warning(f"Could not read settings: {type(e).__name__}: {e}. Using defaults.")
+
+    def save_settings(self, search: Optional[Dict[str, Any]] = None,
+                      quality: Optional[Dict[str, Any]] = None) -> None:
+        """Persist the given (partial) search/quality threshold updates."""
+        if search: self.search_settings.update(search)
+        if quality: self.quality_settings.update(quality)
+        try:
+            tmp = str(self.settings_file) + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"search": self.search_settings, "quality": self.quality_settings}, f, indent=2)
+            os.replace(tmp, str(self.settings_file))
+        except Exception as e:
+            logging.warning(f"Could not save settings: {type(e).__name__}: {e}")
 
     def _load_stats(self) -> Dict[str, Any]:
         if self.stats_file.exists():
@@ -681,7 +732,8 @@ class PhotoSearch:
                 os.replace(temp_idx, str(self.index_file))
                 os.replace(temp_meta, str(self.metadata_file))
                 self.image_embeddings, self.image_paths = all_embeddings, all_paths
-                self.indexed_set = set(self.image_paths); self._embeddings_dirty = True; del all_embeddings
+                self.indexed_set = set(self.image_paths); self._embeddings_dirty = True
+                self._dir_counts = None; del all_embeddings
             gc.collect()
             if self.device == "cuda": torch.cuda.empty_cache()
             logging.info("Indexing complete.")
@@ -794,6 +846,7 @@ class PhotoSearch:
                     self.image_embeddings = None
 
             self._embeddings_dirty = True
+            self._dir_counts = None
 
             # Write temporary files first so a failed write doesn't leave
             # a partially-written JSON file.
@@ -896,7 +949,7 @@ class PhotoSearch:
             for p in [p for p in self.image_metadata if p.startswith(prefix)]: self.image_metadata.pop(p, None)
             if self.image_embeddings is not None:
                 self.image_embeddings = self.image_embeddings[keep_indices].contiguous() if keep_indices else None
-            self._embeddings_dirty = True
+            self._embeddings_dirty = True; self._dir_counts = None
             temp_emb, temp_idx, temp_meta = str(self.embeddings_file)+".tmp", str(self.index_file)+".tmp", str(self.metadata_file)+".tmp"
             try:
                 if self.image_embeddings is not None: torch.save(self.image_embeddings, temp_emb)
@@ -927,7 +980,7 @@ class PhotoSearch:
             for p in [p for p in self.image_metadata if self._fragment_skipped(p)]: self.image_metadata.pop(p, None)
             if self.image_embeddings is not None:
                 self.image_embeddings = self.image_embeddings[keep_indices].contiguous() if keep_indices else None
-            self._embeddings_dirty = True
+            self._embeddings_dirty = True; self._dir_counts = None
             temp_emb, temp_idx, temp_meta = str(self.embeddings_file)+".tmp", str(self.index_file)+".tmp", str(self.metadata_file)+".tmp"
             try:
                 if self.image_embeddings is not None: torch.save(self.image_embeddings, temp_emb)
@@ -962,7 +1015,10 @@ class PhotoSearch:
         if any(existing_parent.is_relative_to(m) for m in ('/run/media', '/media', '/mnt')): return f"Filesystem {existing_parent} not available, please mount"
         return "File not found"
 
-    def search(self, query: str, top_k: int = SEARCH_TOP_K) -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: Optional[int] = None,
+               settings: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        s = self.search_settings if settings is None else settings
+        if top_k is None: top_k = int(s.get("top_k", 60))
         if self.image_embeddings is None or len(self.image_embeddings) == 0: return []
         if self.image_embeddings.shape[1] != self.embedding_dim:
             logging.error(f"Embedding dimension mismatch. Please re-index."); return []
@@ -984,7 +1040,7 @@ class PhotoSearch:
         with torch.no_grad():
             embeddings = self._get_embeddings_gpu()
             similarities = torch.mm(embeddings, text_features.T).squeeze().float()
-            requested_k = min(max(top_k * 40, 1000), len(similarities))
+            requested_k = min(max(top_k * int(s.get("candidate_mult", 40)), 1000), len(similarities))
             values, indices = torch.topk(similarities, requested_k)
 
         cand = embeddings[indices].float().cpu()
@@ -993,7 +1049,8 @@ class PhotoSearch:
         
         if len(scores_np) == 0: return []
         
-        effective_floor = max(SEARCH_FLOOR_MIN, float(scores_np[0]) * SEARCH_FLOOR_RATIO)
+        effective_floor = max(s.get("floor_min", 0.15), float(scores_np[0]) * s.get("floor_ratio", 0.45))
+        dedupe_cos = s.get("dedupe_cos", 0.99)
         results = []
         accepted_refs: List[torch.Tensor] = []
         skipped_dup = 0
@@ -1009,7 +1066,7 @@ class PhotoSearch:
             
             meta = self.image_metadata.get(fp)
             if meta and meta.get('deleted'): continue
-            if meta and self._is_black(meta): continue
+            if meta and self._is_black(meta, s): continue
             err = self._check_file_access(fp)
             if err is not None:
                 if "not available" in err: unmounted.add(err)
@@ -1017,7 +1074,7 @@ class PhotoSearch:
             
             vec = cand[i]
             if accepted_refs:
-                if bool((vec @ torch.stack(accepted_refs).t() > SEARCH_DEDUPE_COS).any()):
+                if bool((vec @ torch.stack(accepted_refs).t() > dedupe_cos).any()):
                     skipped_dup += 1
                     continue
             accepted_refs.append(vec)
@@ -1032,34 +1089,234 @@ class PhotoSearch:
                 logging.warning(f"Search skipped results: {w}")
         return results
 
+    def _darkness(self, meta: Dict[str, Any], q: Optional[Dict[str, Any]] = None) -> float:
+        """[0,1] darkness: 1 when the 95th-percentile luminance is far below the cutoff."""
+        q = self.quality_settings if q is None else q
+        lum_p95 = meta.get("lum_p95")
+        if lum_p95 is None: return 0.0
+        cut = float(q.get("dark_lum_p95", 25.0)); span = max(1e-6, float(q.get("dark_span", 25.0)))
+        return max(0.0, min(1.0, (cut - lum_p95) / span))
+
+    def _blur(self, meta: Dict[str, Any], q: Optional[Dict[str, Any]] = None) -> float:
+        """[0,1] blur: 1 when the 95th-percentile Laplacian is far below the cutoff."""
+        q = self.quality_settings if q is None else q
+        lap_p95 = meta.get("lap_p95")
+        if lap_p95 is None: return 0.0
+        cut = float(q.get("blur_lap_p95", 12.0)); span = max(1e-6, float(q.get("blur_span", 10.0)))
+        return max(0.0, min(1.0, (cut - lap_p95) / span))
+
+    def _overexposure(self, meta: Dict[str, Any], q: Optional[Dict[str, Any]] = None) -> float:
+        """[0,1] overexposure from blown highlights and/or a high mean luminance."""
+        q = self.quality_settings if q is None else q
+        score = 0.0
+        lum_p95, mean_lum = meta.get("lum_p95"), meta.get("mean_lum")
+        if lum_p95 is not None:
+            cut = float(q.get("over_lum_p95", 235.0)); span = max(1e-6, float(q.get("over_lum_span", 20.0)))
+            score = max(score, max(0.0, min(1.0, (lum_p95 - cut) / span)))
+        if mean_lum is not None:
+            cut = float(q.get("over_mean_lum", 200.0)); span = max(1e-6, float(q.get("over_mean_span", 55.0)))
+            score = max(score, max(0.0, min(1.0, (mean_lum - cut) / span)))
+        return score
+
     def _badness(self, meta: Dict[str, Any]) -> float:
         """Badness in [0, 2]: 0 = healthy; near-black and/or blurry raises it."""
-        lum_p95, lap_p95 = meta.get("lum_p95"), meta.get("lap_p95")
-        if lum_p95 is None or lap_p95 is None: return 0.0
-        dark = max(0.0, min(1.0, (25.0 - lum_p95) / 25.0))
-        blur = max(0.0, min(1.0, (12.0 - lap_p95) / 10.0))
-        return dark + blur
+        return self._darkness(meta) + self._blur(meta)
+
+    def _problem_score(self, kind: str, meta: Dict[str, Any],
+                       q: Optional[Dict[str, Any]] = None) -> float:
+        if kind == "dark": return self._darkness(meta, q)
+        if kind == "blurry": return self._blur(meta, q)
+        if kind == "overexposed": return self._overexposure(meta, q)
+        return max(self._darkness(meta, q), self._blur(meta, q), self._overexposure(meta, q))
 
     def _is_garbage(self, meta: Dict[str, Any]) -> bool:
         return self._badness(meta) >= 1.5
 
-    def _is_black(self, meta: Dict[str, Any]) -> bool:
-        """Near-black frame: 95th-percentile luminance <= 10/255."""
+    def _is_black(self, meta: Dict[str, Any], s: Optional[Dict[str, Any]] = None) -> bool:
+        """Near-black frame hidden from search results (configurable)."""
+        s = self.search_settings if s is None else s
         lum_p95 = meta.get("lum_p95")
-        return lum_p95 is not None and lum_p95 <= 10.0
+        return lum_p95 is not None and lum_p95 <= float(s.get("black_lum_p95", 10.0))
 
-    def get_garbage_photos(self, offset: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
-        """Worst photos by badness score, highest first; window [offset, offset+limit)."""
-        scored = sorted(((self._badness(m), p) for p, m in self.image_metadata.items()
-                         if not m.get('deleted')), reverse=True)
-        total = sum(1 for s, _ in scored if s > 0.0)
+    def get_problem_photos(self, kind: str = "all", offset: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
+        """Worst photos for a problem `kind` (dark/blurry/overexposed/all), highest first."""
+        scored = []
+        for p, m in self.image_metadata.items():
+            if m.get('deleted'): continue
+            sc = self._problem_score(kind, m)
+            if sc > 0.0: scored.append((sc, p))
+        scored.sort(reverse=True)
+        total = len(scored)
         if total: offset %= total
         out = []
-        for s, p in scored:
-            if len(out) >= limit or s <= 0.0: break
+        for sc, p in scored:
+            if len(out) >= limit: break
             if offset > 0: offset -= 1; continue
             if self._check_file_access(p) is None:
-                out.append({"file": p, "score": round(s, 2), "is_garbage": True})
+                out.append({"file": p, "score": round(sc, 2), "is_garbage": True, "kind": kind})
+        return out
+
+    def get_garbage_photos(self, offset: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
+        return self.get_problem_photos("all", offset, limit)
+
+    def count_problem_photos(self, kinds: Tuple[str, ...] = ("dark", "blurry", "overexposed"),
+                             q: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
+        """Count indexed photos flagged by each problem kind under (candidate) thresholds."""
+        counts = {k: 0 for k in kinds}
+        for m in self.image_metadata.values():
+            if m.get('deleted'): continue
+            for k in kinds:
+                if self._problem_score(k, m, q) > 0.0: counts[k] += 1
+        return counts
+
+    # --- Duplicate ranking helpers ---
+
+    def _photo_counts_by_dir(self) -> Dict[str, int]:
+        """Number of indexed photos per exact directory (cached; invalidated on index changes)."""
+        if self._dir_counts is None:
+            counts: Dict[str, int] = {}
+            for p in self.image_paths:
+                d = os.path.dirname(p); counts[d] = counts.get(d, 0) + 1
+            self._dir_counts = counts
+        return self._dir_counts
+
+    def rank_duplicate_group(self, group: List[str]) -> List[str]:
+        """Order a duplicate group best-copy-first (prefer real libraries over junk dirs)."""
+        if not group: return list(group)
+        counts = self._photo_counts_by_dir()
+
+        def keyf(p: str) -> Tuple:
+            rp = os.path.realpath(p); low = rp.lower()
+            junk = any(frag in low for frag in DUPE_JUNK_FRAGMENTS)
+            try: mtime = os.path.getmtime(rp)
+            except OSError: mtime = 0.0
+            return (not junk, counts.get(os.path.dirname(rp), 0),
+                    -rp.count(os.sep), -len(rp), -mtime)
+
+        return sorted(group, key=keyf, reverse=True)
+
+    def rename_indexed_path(self, old: str, new: str) -> bool:
+        """Update the index in memory after a file was moved on disk."""
+        with self._lock:
+            try: idx = self.image_paths.index(old)
+            except ValueError: return False
+            self.image_paths[idx] = new
+            self.indexed_set.discard(old); self.indexed_set.add(new)
+            if old in self.image_metadata:
+                self.image_metadata[new] = self.image_metadata.pop(old)
+            self._dir_counts = None; self._embeddings_dirty = True
+            return True
+
+    def save_index_files(self) -> None:
+        """Atomically persist the current paths/metadata/embeddings."""
+        with self._lock:
+            temp_emb = str(self.embeddings_file) + ".tmp"
+            temp_idx = str(self.index_file) + ".tmp"
+            temp_meta = str(self.metadata_file) + ".tmp"
+            if self.image_embeddings is not None: torch.save(self.image_embeddings, temp_emb)
+            with open(temp_idx, "w", errors='surrogateescape') as f: json.dump(self.image_paths, f)
+            with open(temp_meta, "w", errors='surrogateescape') as f: json.dump(self.image_metadata, f)
+            if self.image_embeddings is not None: os.replace(temp_emb, str(self.embeddings_file))
+            os.replace(temp_idx, str(self.index_file)); os.replace(temp_meta, str(self.metadata_file))
+
+    @staticmethod
+    def _unique_dest_path(dst_dir: str, filename: str) -> str:
+        target = os.path.join(dst_dir, filename)
+        if not os.path.exists(target): return target
+        stem, ext = os.path.splitext(filename); i = 1
+        while True:
+            cand = os.path.join(dst_dir, f"{stem}_{i}{ext}")
+            if not os.path.exists(cand): return cand
+            i += 1
+
+    def _indexed_photos_in_dir(self, directory: str) -> List[str]:
+        prefix = os.path.realpath(directory) + os.sep
+        return [p for p in self.image_paths if p.startswith(prefix)
+                and not self.image_metadata.get(p, {}).get('deleted')]
+
+    def plan_merge(self, src_dir: str, dst_dir: str, duplicate_groups: List[List[str]]) -> Tuple[List[str], List[str]]:
+        """Return (unique_src_files, redundant_src_files) for merging src into dst."""
+        src_prefix = os.path.realpath(src_dir) + os.sep
+        dst_dir = os.path.realpath(dst_dir); dst_prefix = dst_dir + os.sep
+        src_files = self._indexed_photos_in_dir(src_dir)
+        redundant: Set[str] = set()
+        for group in duplicate_groups:
+            if any(f.startswith(dst_prefix) for f in group):
+                for f in group:
+                    if f.startswith(src_prefix): redundant.add(f)
+        unique = [f for f in src_files if f not in redundant]
+        return unique, sorted(redundant)
+
+    def merge_directories(self, src_dir: str, dst_dir: str,
+                          duplicate_groups: List[List[str]],
+                          progress: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+        """Move src's unique indexed images into dst and trash src's redundant copies.
+
+        Only indexed image files are touched; other files are left untouched so a
+        non-mirror source directory is never silently emptied.
+        """
+        if progress: progress("Planning merge...")
+        unique, redundant = self.plan_merge(src_dir, dst_dir, duplicate_groups)
+        moved, trashed, failed = [], [], []
+        for i, f in enumerate(unique):
+            if progress and i % 25 == 0: progress(f"Moving unique files... {i}/{len(unique)}")
+            dest = self._unique_dest_path(dst_dir, os.path.basename(f))
+            try:
+                shutil.move(f, dest)
+                if self.rename_indexed_path(f, dest): moved.append((f, dest))
+                else: moved.append((f, dest))
+            except Exception as e:
+                logging.warning(f"Merge move failed for {f!r}: {type(e).__name__}: {e}"); failed.append(f)
+        for f in redundant:
+            if QFile.moveToTrash(f): trashed.append(f)
+            else: failed.append(f)
+        if trashed: self.mark_photos_deleted(trashed)
+        if moved or trashed: self.save_index_files()
+        return {"moved": moved, "trashed": trashed, "failed": failed}
+
+    def trash_directory_indexed(self, directory: str,
+                                progress: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+        """Trash every indexed image in a directory (used for redundant mirror folders)."""
+        targets = self._indexed_photos_in_dir(directory)
+        trashed, failed = [], []
+        for i, f in enumerate(targets):
+            if progress and i % 25 == 0: progress(f"Moving to trash... {i}/{len(targets)}")
+            if QFile.moveToTrash(f): trashed.append(f)
+            else: failed.append(f)
+        if trashed: self.mark_photos_deleted(trashed)
+        return {"trashed": trashed, "failed": failed}
+
+    def compute_folder_duplicate_stats(self, all_groups: List[List[str]]) -> List[Dict[str, Any]]:
+        """Folder-pair duplicate overlap: shared files, wasted bytes, and coverage."""
+        thr = float(self.quality_settings.get("folder_mirror_coverage", 0.90))
+        dir_total = self._photo_counts_by_dir()
+        pair: Dict[Tuple[str, str], Dict[str, int]] = {}
+        for group in all_groups:
+            by_dir: Dict[str, List[str]] = {}
+            for f in group: by_dir.setdefault(os.path.dirname(f), []).append(f)
+            dirs = list(by_dir.keys())
+            for i in range(len(dirs)):
+                a = dirs[i]
+                for j in range(i + 1, len(dirs)):
+                    b = dirs[j]
+                    key = tuple(sorted([a, b]))
+                    try: size = os.path.getsize(by_dir[a][0])
+                    except OSError: size = 0
+                    shared = min(len(by_dir[a]), len(by_dir[b]))
+                    rec = pair.setdefault(key, {"shared": 0, "bytes": 0})
+                    rec["shared"] += shared; rec["bytes"] += shared * size
+        out = []
+        for (a, b), rec in pair.items():
+            ta, tb = dir_total.get(a, 0), dir_total.get(b, 0)
+            cov_a = rec["shared"] / ta if ta else 0.0
+            cov_b = rec["shared"] / tb if tb else 0.0
+            if cov_a >= thr and cov_b >= thr: kind = "mirror"
+            elif cov_a >= thr or cov_b >= thr: kind = "subset"
+            else: kind = "partial"
+            out.append({"a": a, "b": b, "shared": rec["shared"], "bytes": rec["bytes"],
+                        "cov_a": cov_a, "cov_b": cov_b, "kind": kind,
+                        "total_a": ta, "total_b": tb})
+        out.sort(key=lambda r: r["bytes"], reverse=True)
         return out
 
 
@@ -1105,8 +1362,34 @@ class SearchWorker(QThread):
 
 class GarbageWorker(QThread):
     result = pyqtSignal(list)
-    def __init__(self, searcher: PhotoSearch): super().__init__(); self.searcher = searcher
-    def run(self): self.result.emit(self.searcher.get_garbage_photos(getattr(self.searcher, "_garbage_offset", 0)))
+    def __init__(self, searcher: PhotoSearch, kind: str = "all"):
+        super().__init__(); self.searcher, self.kind = searcher, kind
+    def run(self):
+        self.result.emit(self.searcher.get_problem_photos(self.kind, getattr(self.searcher, "_garbage_offset", 0)))
+
+
+class SearchPreviewWorker(QThread):
+    """Non-mutating re-run of a query with candidate search thresholds."""
+    done = pyqtSignal(int, float)
+    def __init__(self, searcher: PhotoSearch, query: str, settings: Dict[str, Any]):
+        super().__init__(); self.searcher, self.query, self.settings = searcher, query, dict(settings)
+    def run(self):
+        try:
+            results = self.searcher.search(self.query, settings=self.settings) if self.query.strip() else []
+            top = results[0]["score"] if results else 0.0
+            self.done.emit(len(results), float(top))
+        except Exception as e:
+            logging.warning(f"Search preview failed: {type(e).__name__}: {e}"); self.done.emit(0, 0.0)
+
+
+class QualityPreviewWorker(QThread):
+    """Counts photos matching each problem kind under candidate quality thresholds."""
+    done = pyqtSignal(dict)
+    def __init__(self, searcher: PhotoSearch, settings: Dict[str, Any]):
+        super().__init__(); self.searcher, self.settings = searcher, dict(settings)
+    def run(self):
+        try: self.done.emit(self.searcher.count_problem_photos(q=self.settings))
+        except Exception: self.done.emit({})
 
 
 class CleanWorker(QThread):
@@ -1230,7 +1513,7 @@ class DuplicateDialog(QDialog):
         btn_layout = QVBoxLayout()
         self.dup_folders_btn = QPushButton("Show Duplicate Folders"); self.dup_folders_btn.clicked.connect(self.show_duplicate_folders)
         self.trash_btn = QPushButton("Move Selected to Trash"); self.trash_btn.clicked.connect(self.trash_selected); self.trash_btn.setEnabled(False)
-        self.trash_rest_btn = QPushButton("Keep First, Trash Rest"); self.trash_rest_btn.clicked.connect(self.trash_rest); self.trash_rest_btn.setEnabled(False)
+        self.trash_rest_btn = QPushButton("Keep Best, Trash Rest"); self.trash_rest_btn.clicked.connect(self.trash_rest); self.trash_rest_btn.setEnabled(False)
         btn_layout.addWidget(self.dup_folders_btn); btn_layout.addStretch()
         btn_layout.addWidget(self.trash_rest_btn); btn_layout.addWidget(self.trash_btn)
         content_layout.addLayout(btn_layout); main_layout.addLayout(content_layout)
@@ -1265,9 +1548,10 @@ class DuplicateDialog(QDialog):
         if self.worker: self.info_label.setText("Stopping..."); self.worker.stop()
 
     def add_groups_chunk(self, groups: List[List[str]]) -> None:
-        self.all_groups.extend(groups)
-        if self.page_offset >= len(self.all_groups) - self.PAGE_SIZE - len(groups):
-            self.page_offset = len(self.all_groups) - len(groups); self.render_current_page()
+        ranked = [self.searcher.rank_duplicate_group(g) for g in groups]
+        self.all_groups.extend(ranked)
+        if self.page_offset >= len(self.all_groups) - self.PAGE_SIZE - len(ranked):
+            self.page_offset = len(self.all_groups) - len(ranked); self.render_current_page()
         self.update_next_button_state()
 
     def stream_finished(self, duration: float, total_dupes: int) -> None:
@@ -1303,7 +1587,7 @@ class DuplicateDialog(QDialog):
         self.current_group_index = actual_index; group = self.all_groups[actual_index]
         for i, path in enumerate(group):
             item = QListWidgetItem(); item.setData(Qt.ItemDataRole.UserRole, path); item.setSizeHint(QSize(200, 200))
-            item.setToolTip(os.path.basename(path) + ("\n(Original)" if i == 0 else ""))
+            item.setToolTip(os.path.basename(path) + ("\n(Keep \u2014 best copy)" if i == 0 else ""))
             self.image_list.addItem(item); self._path_to_item[path] = item; self._thumb_queue.put(path)
         if len(group) > 1: self.trash_rest_btn.setEnabled(True)
 
@@ -1369,6 +1653,12 @@ class DuplicateDialog(QDialog):
             self.setWindowTitle(f"Duplicate Manager ({len(self.all_groups)} Total Sets Found)")
 
     def _delete_paths(self, paths_to_delete: List[str], items_to_remove: List[QListWidgetItem]) -> None:
+        if not paths_to_delete: return
+        msg = (f"Move this file to Trash?\n{paths_to_delete[0]}" if len(paths_to_delete) == 1
+               else f"Move {len(paths_to_delete)} files to Trash?")
+        if QMessageBox.question(self, "Move to Trash", msg,
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
         success_paths = []; fail_paths = []
         for p in paths_to_delete:
             if QFile.moveToTrash(p): success_paths.append(p)
@@ -1380,48 +1670,268 @@ class DuplicateDialog(QDialog):
     def _open_in_explorer(self, path: str) -> None: open_in_file_browser(path)
 
     def show_duplicate_folders(self) -> None:
-        dir_pairs: Dict[Tuple[str, str], int] = {}
-        for group in self.all_groups:
-            dirs = list({os.path.dirname(f) for f in group})
-            if len(dirs) > 1:
-                for i in range(len(dirs)):
-                    for j in range(i + 1, len(dirs)):
-                        pair = tuple(sorted([dirs[i], dirs[j]])); dir_pairs[pair] = dir_pairs.get(pair, 0) + 1
-        if not dir_pairs:
+        stats = self.searcher.compute_folder_duplicate_stats(self.all_groups)
+        if not stats:
             QMessageBox.information(self, "Duplicate Folders", "No overlapping duplicate folders found."); return
-        dialog = QDialog(self); dialog.setWindowTitle("Duplicate Folders Analysis"); dialog.resize(700, 500)
+
+        dialog = QDialog(self); dialog.setWindowTitle("Duplicate Folders Analysis"); dialog.resize(860, 580)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("Double-click a row or use the button below to open the folder in your file browser."))
+        layout.addWidget(QLabel(
+            "Folder pairs sharing duplicate files, largest potential waste first.\n"
+            "mirror = both folders mostly duplicated; subset = one is contained in the other.\n"
+            "Merge/drop touch only PhotoFind-indexed images; other files are left untouched."))
         list_widget = QListWidget()
-        for (d1, d2), count in sorted(dir_pairs.items(), key=lambda x: x[1], reverse=True)[:100]:
-            item = QListWidgetItem(f"[{count} files]\n  {d1}\n  \u2194\n  {d2}")
-            item.setData(Qt.ItemDataRole.UserRole, (d1, d2)); list_widget.addItem(item)
-        list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        def on_context_menu(position: QPoint) -> None:
-            item = list_widget.itemAt(position)
-            if not item: return
-            d1, d2 = item.data(Qt.ItemDataRole.UserRole)
-            menu = QMenu(list_widget)
-            menu.addAction(f"Open: {d1}").triggered.connect(lambda _, p=d1: self._open_in_explorer(p))
-            menu.addAction(f"Open: {d2}").triggered.connect(lambda _, p=d2: self._open_in_explorer(p))
-            menu.exec(list_widget.viewport().mapToGlobal(position))
-        list_widget.customContextMenuRequested.connect(on_context_menu)
-        list_widget.itemDoubleClicked.connect(lambda item: self._open_in_explorer(item.data(Qt.ItemDataRole.UserRole)[0]))
+
+        def fmt_bytes(n: int) -> str:
+            return f"{n} B" if n < 1024 else (f"{n/1024:.1f} KB" if n < 1024*1024 else f"{n/(1024*1024):.1f} MB")
+
+        def populate() -> None:
+            list_widget.clear()
+            for rec in self.searcher.compute_folder_duplicate_stats(self.all_groups)[:200]:
+                line = (f"[{rec['kind'].upper()}] {rec['shared']} shared \u2022 {fmt_bytes(rec['bytes'])} potential waste\n"
+                        f"  A ({rec['cov_a']*100:.0f}% dup of {rec['total_a']}) {rec['a']}\n"
+                        f"  B ({rec['cov_b']*100:.0f}% dup of {rec['total_b']}) {rec['b']}")
+                item = QListWidgetItem(line); item.setData(Qt.ItemDataRole.UserRole, rec); list_widget.addItem(item)
+        populate()
+        list_widget.itemDoubleClicked.connect(lambda item: self._open_in_explorer(item.data(Qt.ItemDataRole.UserRole)["a"]))
         layout.addWidget(list_widget)
+
+        status = QLabel("Select a row, then choose an action.")
+        status.setFrameStyle(QFrame.Shape.Panel | QFrame.Shadow.Sunken); status.setMargin(5)
+        layout.addWidget(status)
+
         btn_layout = QHBoxLayout()
-        open_btn = QPushButton("Open Selected Folder")
-        def on_open_clicked() -> None:
+        merge_ab = QPushButton("Merge A \u2192 B"); merge_ba = QPushButton("Merge B \u2192 A")
+        drop_a = QPushButton("Drop Folder A"); drop_b = QPushButton("Drop Folder B")
+        open_btn = QPushButton("Open\u2026"); close_btn = QPushButton("Close")
+        for b in (merge_ab, merge_ba, drop_a, drop_b, open_btn): btn_layout.addWidget(b)
+        btn_layout.addStretch(); btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        def current_rec() -> Optional[Dict[str, Any]]:
             item = list_widget.currentItem()
-            if not item: return
-            d1, d2 = item.data(Qt.ItemDataRole.UserRole)
+            return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+        def confirm_and_run(operation: str, src: str, dst: Optional[str], label: str) -> None:
+            if operation == "merge":
+                assert dst is not None
+                unique, redundant = self.searcher.plan_merge(src, dst, self.all_groups)
+                if not unique and not redundant:
+                    QMessageBox.information(dialog, "Nothing to do", "No indexed images found to merge."); return
+                msg = (f"Merge folder:\n  {src}\n\u2192 {dst}\n\n"
+                       f"{len(unique)} unique file(s) will be MOVED to the destination.\n"
+                       f"{len(redundant)} duplicate file(s) will be moved to Trash.\n\n"
+                       f"Non-image files are left untouched. Continue?")
+            else:
+                targets = self.searcher._indexed_photos_in_dir(src)
+                if not targets:
+                    QMessageBox.information(dialog, "Nothing to do", "No indexed images found in that folder."); return
+                msg = (f"Drop folder (move all indexed images to Trash):\n  {src}\n\n"
+                       f"{len(targets)} indexed image(s) will be moved to Trash. Continue?")
+            if QMessageBox.question(dialog, label, msg,
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            status.setText(f"{label}: working..."); QApplication.processEvents()
+            try:
+                if operation == "merge":
+                    res = self.searcher.merge_directories(src, dst or "", self.all_groups)
+                else:
+                    res = self.searcher.trash_directory_indexed(src)
+            except Exception as e:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.warning(dialog, "Error", f"Operation failed: {type(e).__name__}: {e}"); return
+            QApplication.restoreOverrideCursor()
+            for old, _new in res.get("moved", []): self.purge_file_from_all_groups(old)
+            for p in res.get("trashed", []): self.purge_file_from_all_groups(p)
+            populate()
+            moved, trashed, failed = len(res.get("moved", [])), len(res.get("trashed", [])), len(res.get("failed", []))
+            status.setText(f"Done: moved {moved}, trashed {trashed}, failed {failed}.")
+            QMessageBox.information(dialog, label, f"Operation complete.\nMoved: {moved}\nTrashed: {trashed}\nFailed: {failed}")
+
+        def wire(btn: QPushButton, operation: str, src_key: str, dst_key: Optional[str], label: str) -> None:
+            def handler(_checked: bool = False) -> None:
+                rec = current_rec()
+                if not rec: return
+                confirm_and_run(operation, rec[src_key], (rec[dst_key] if dst_key else None), label)
+            btn.clicked.connect(handler)
+        wire(merge_ab, "merge", "a", "b", "Merge A \u2192 B")
+        wire(merge_ba, "merge", "b", "a", "Merge B \u2192 A")
+        wire(drop_a, "drop", "a", None, "Drop Folder A")
+        wire(drop_b, "drop", "b", None, "Drop Folder B")
+
+        def on_open() -> None:
+            rec = current_rec()
+            if not rec: return
             menu = QMenu(open_btn)
-            menu.addAction(f"Open: {d1}").triggered.connect(lambda _, p=d1: self._open_in_explorer(p))
-            menu.addAction(f"Open: {d2}").triggered.connect(lambda _, p=d2: self._open_in_explorer(p))
+            menu.addAction(f"Open A: {rec['a']}").triggered.connect(lambda _, p=rec["a"]: self._open_in_explorer(p))
+            menu.addAction(f"Open B: {rec['b']}").triggered.connect(lambda _, p=rec["b"]: self._open_in_explorer(p))
             menu.exec(open_btn.mapToGlobal(QPoint(0, open_btn.height())))
-        open_btn.clicked.connect(on_open_clicked)
-        close_btn = QPushButton("Close"); close_btn.clicked.connect(dialog.close)
-        btn_layout.addStretch(); btn_layout.addWidget(open_btn); btn_layout.addWidget(close_btn)
-        layout.addLayout(btn_layout); dialog.exec()
+        open_btn.clicked.connect(on_open)
+        close_btn.clicked.connect(dialog.close)
+        dialog.exec()
+
+
+class SettingsDialog(QDialog):
+    """Two-tab tuning dialog: search accuracy and photo-quality thresholds.
+
+    Values are previewed live (debounced) against the loaded index/metadata and
+    only persisted to ~/.cache/photofind/settings.json when Apply is pressed.
+    """
+
+    def __init__(self, searcher: PhotoSearch, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.searcher = searcher
+        self.setWindowTitle("Search Tuning"); self.resize(580, 600)
+        self._search_worker = None; self._quality_worker = None
+        self._search_timer = QTimer(self); self._search_timer.setSingleShot(True); self._search_timer.setInterval(350)
+        self._search_timer.timeout.connect(self._run_search_preview)
+        self._quality_timer = QTimer(self); self._quality_timer.setSingleShot(True); self._quality_timer.setInterval(350)
+        self._quality_timer.timeout.connect(self._run_quality_preview)
+
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget(); layout.addWidget(self.tabs)
+        self._build_search_tab(); self._build_quality_tab()
+
+        btns = QDialogButtonBox()
+        reset_btn = btns.addButton("Reset to Defaults", QDialogButtonBox.ButtonRole.ResetRole)
+        apply_btn = btns.addButton("Apply", QDialogButtonBox.ButtonRole.ApplyRole)
+        cancel_btn = btns.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        reset_btn.clicked.connect(self._reset_defaults)
+        apply_btn.clicked.connect(self._apply)
+        cancel_btn.clicked.connect(self.reject)
+        layout.addWidget(btns)
+        self._queue_search_preview(); self._queue_quality_preview()
+
+    @staticmethod
+    def _make_d(value: float, lo: float, hi: float, step: float, decimals: int) -> QDoubleSpinBox:
+        sb = QDoubleSpinBox(); sb.setRange(lo, hi); sb.setSingleStep(step); sb.setDecimals(decimals)
+        sb.setValue(value); return sb
+
+    @staticmethod
+    def _make_i(value: int, lo: int, hi: int) -> QSpinBox:
+        sb = QSpinBox(); sb.setRange(lo, hi); sb.setValue(value); return sb
+
+    def _build_search_tab(self) -> None:
+        tab = QWidget(); form = QFormLayout(tab); s = self.searcher.search_settings
+        parent = self.parent()
+        initial_q = parent.search_input.text() if parent is not None and hasattr(parent, "search_input") else ""
+        self.q_input = QLineEdit(initial_q); self.q_input.setPlaceholderText("Type a query to preview result counts")
+        form.addRow("Preview query:", self.q_input)
+        self.sp_top_k = self._make_i(int(s["top_k"]), 1, 500)
+        self.sp_floor_min = self._make_d(float(s["floor_min"]), 0.0, 0.9, 0.01, 3)
+        self.sp_floor_ratio = self._make_d(float(s["floor_ratio"]), 0.0, 1.0, 0.01, 3)
+        self.sp_dedupe = self._make_d(float(s["dedupe_cos"]), 0.50, 1.0, 0.005, 3)
+        form.addRow("Max results (top_k):", self.sp_top_k)
+        form.addRow("Relevance floor (absolute):", self.sp_floor_min)
+        form.addRow("Relevance floor (\u00d7 best hit):", self.sp_floor_ratio)
+        form.addRow("Near-duplicate cutoff:", self.sp_dedupe)
+        advanced = QGroupBox("Advanced"); aform = QFormLayout(advanced)
+        self.sp_cand = self._make_i(int(s["candidate_mult"]), 1, 200)
+        self.sp_black = self._make_d(float(s["black_lum_p95"]), 0.0, 255.0, 1.0, 1)
+        aform.addRow("Candidate pool multiplier:", self.sp_cand)
+        aform.addRow("Hide photos darker than (lum_p95):", self.sp_black)
+        form.addRow(advanced)
+        self.search_preview = QLabel("\u2014")
+        self.search_preview.setFrameStyle(QFrame.Shape.Panel | QFrame.Shadow.Sunken); self.search_preview.setMargin(5)
+        form.addRow("Live preview:", self.search_preview)
+        self.tabs.addTab(tab, "Search Accuracy")
+        for w in (self.sp_top_k, self.sp_floor_min, self.sp_floor_ratio, self.sp_dedupe, self.sp_cand, self.sp_black):
+            w.valueChanged.connect(self._queue_search_preview)
+        self.q_input.textChanged.connect(self._queue_search_preview)
+
+    def _build_quality_tab(self) -> None:
+        tab = QWidget(); form = QFormLayout(tab); q = self.searcher.quality_settings
+        dark = QGroupBox("Dark"); dform = QFormLayout(dark)
+        self.sp_dark = self._make_d(float(q["dark_lum_p95"]), 0.0, 255.0, 1.0, 1)
+        self.sp_dark_span = self._make_d(float(q["dark_span"]), 1.0, 255.0, 1.0, 1)
+        dform.addRow("Darkness cutoff (lum_p95 below):", self.sp_dark)
+        dform.addRow("Darkness span:", self.sp_dark_span)
+        form.addRow(dark)
+        blur = QGroupBox("Blurry"); bform = QFormLayout(blur)
+        self.sp_blur = self._make_d(float(q["blur_lap_p95"]), 0.0, 255.0, 0.5, 2)
+        self.sp_blur_span = self._make_d(float(q["blur_span"]), 0.5, 255.0, 0.5, 2)
+        bform.addRow("Blur cutoff (lap_p95 below):", self.sp_blur)
+        bform.addRow("Blur span:", self.sp_blur_span)
+        form.addRow(blur)
+        over = QGroupBox("Overexposed"); oform = QFormLayout(over)
+        self.sp_over_lum = self._make_d(float(q["over_lum_p95"]), 100.0, 255.0, 1.0, 1)
+        self.sp_over_lum_span = self._make_d(float(q["over_lum_span"]), 1.0, 255.0, 1.0, 1)
+        self.sp_over_mean = self._make_d(float(q["over_mean_lum"]), 0.0, 255.0, 1.0, 1)
+        self.sp_over_mean_span = self._make_d(float(q["over_mean_span"]), 1.0, 255.0, 1.0, 1)
+        oform.addRow("Highlights cutoff (lum_p95 above):", self.sp_over_lum)
+        oform.addRow("Highlights span:", self.sp_over_lum_span)
+        oform.addRow("Mean luminance cutoff (above):", self.sp_over_mean)
+        oform.addRow("Mean luminance span:", self.sp_over_mean_span)
+        form.addRow(over)
+        folders = QGroupBox("Folders"); fform = QFormLayout(folders)
+        self.sp_mirror = self._make_d(float(q["folder_mirror_coverage"]), 0.0, 1.0, 0.01, 2)
+        fform.addRow("Folder mirror coverage:", self.sp_mirror)
+        form.addRow(folders)
+        self.quality_preview = QLabel("\u2014")
+        self.quality_preview.setFrameStyle(QFrame.Shape.Panel | QFrame.Shadow.Sunken); self.quality_preview.setMargin(5)
+        form.addRow("Live preview:", self.quality_preview)
+        self.tabs.addTab(tab, "Quality")
+        for w in (self.sp_dark, self.sp_dark_span, self.sp_blur, self.sp_blur_span,
+                  self.sp_over_lum, self.sp_over_lum_span, self.sp_over_mean,
+                  self.sp_over_mean_span, self.sp_mirror):
+            w.valueChanged.connect(self._queue_quality_preview)
+
+    def _collect_search(self) -> Dict[str, Any]:
+        return {"top_k": int(self.sp_top_k.value()), "floor_min": float(self.sp_floor_min.value()),
+                "floor_ratio": float(self.sp_floor_ratio.value()), "dedupe_cos": float(self.sp_dedupe.value()),
+                "candidate_mult": int(self.sp_cand.value()), "black_lum_p95": float(self.sp_black.value())}
+
+    def _collect_quality(self) -> Dict[str, Any]:
+        return {"dark_lum_p95": float(self.sp_dark.value()), "dark_span": float(self.sp_dark_span.value()),
+                "blur_lap_p95": float(self.sp_blur.value()), "blur_span": float(self.sp_blur_span.value()),
+                "over_lum_p95": float(self.sp_over_lum.value()), "over_lum_span": float(self.sp_over_lum_span.value()),
+                "over_mean_lum": float(self.sp_over_mean.value()), "over_mean_span": float(self.sp_over_mean_span.value()),
+                "folder_mirror_coverage": float(self.sp_mirror.value())}
+
+    def _queue_search_preview(self, *_args: Any) -> None: self._search_timer.start()
+    def _queue_quality_preview(self, *_args: Any) -> None: self._quality_timer.start()
+
+    def _run_search_preview(self) -> None:
+        query = self.q_input.text().strip()
+        if self.searcher.image_embeddings is None:
+            self.search_preview.setText("No index loaded."); return
+        if not query:
+            self.search_preview.setText("Enter a query to preview."); return
+        self.search_preview.setText("Counting\u2026")
+        w = SearchPreviewWorker(self.searcher, query, self._collect_search())
+        self._search_worker = w; w.done.connect(self._on_search_preview); w.finished.connect(w.deleteLater); w.start()
+
+    def _on_search_preview(self, count: int, top: float) -> None:
+        self.search_preview.setText(f"\u2248{count} photo(s) match  \u2022  top score {top:.3f}")
+
+    def _run_quality_preview(self) -> None:
+        self.quality_preview.setText("Counting\u2026")
+        w = QualityPreviewWorker(self.searcher, self._collect_quality())
+        self._quality_worker = w; w.done.connect(self._on_quality_preview); w.finished.connect(w.deleteLater); w.start()
+
+    def _on_quality_preview(self, counts: Dict[str, int]) -> None:
+        if not counts:
+            self.quality_preview.setText("No metadata loaded yet."); return
+        self.quality_preview.setText(
+            f"dark {counts.get('dark', 0)}  \u2022  blurry {counts.get('blurry', 0)}  "
+            f"\u2022  overexposed {counts.get('overexposed', 0)}")
+
+    def _reset_defaults(self) -> None:
+        s, q = DEFAULT_SEARCH_SETTINGS, DEFAULT_QUALITY_SETTINGS
+        self.sp_top_k.setValue(int(s["top_k"])); self.sp_floor_min.setValue(float(s["floor_min"]))
+        self.sp_floor_ratio.setValue(float(s["floor_ratio"])); self.sp_dedupe.setValue(float(s["dedupe_cos"]))
+        self.sp_cand.setValue(int(s["candidate_mult"])); self.sp_black.setValue(float(s["black_lum_p95"]))
+        self.sp_dark.setValue(float(q["dark_lum_p95"])); self.sp_dark_span.setValue(float(q["dark_span"]))
+        self.sp_blur.setValue(float(q["blur_lap_p95"])); self.sp_blur_span.setValue(float(q["blur_span"]))
+        self.sp_over_lum.setValue(float(q["over_lum_p95"])); self.sp_over_lum_span.setValue(float(q["over_lum_span"]))
+        self.sp_over_mean.setValue(float(q["over_mean_lum"])); self.sp_over_mean_span.setValue(float(q["over_mean_span"]))
+        self.sp_mirror.setValue(float(q["folder_mirror_coverage"]))
+        self._queue_search_preview(); self._queue_quality_preview()
+
+    def _apply(self) -> None:
+        self.searcher.save_settings(search=self._collect_search(), quality=self._collect_quality())
+        self.accept()
 
 
 class PhotoOrganizerWindow(QMainWindow):
@@ -1439,6 +1949,8 @@ class PhotoOrganizerWindow(QMainWindow):
         
         self._is_indexing = False
         self._pending_search_query = None
+        self._garbage_kind = None
+        self._garbage_page = 0
 
         if self.searcher.load_index(): self.statusBar().showMessage(self._get_idle_status_message())
         else: self.statusBar().showMessage("Ready. No index loaded.")
@@ -1478,8 +1990,15 @@ class PhotoOrganizerWindow(QMainWindow):
     def setup_ui(self) -> None:
         central_widget = QWidget(); self.setCentralWidget(central_widget); layout = QVBoxLayout(central_widget); search_layout = QHBoxLayout()
         self.search_input = QLineEdit(); self.search_input.setPlaceholderText("Type a description..."); self.search_input.returnPressed.connect(self.start_search)
-        search_btn = QPushButton("Search"); search_btn.clicked.connect(self.start_search); self.garbage_btn = QPushButton("Find 50 Bad Photos"); self.garbage_btn.clicked.connect(self.next_garbage_page)
-        self.garbage_btn.setToolTip("Worst 50 photos by badness (darkness + blur). Click again for the next 50.")
+        search_btn = QPushButton("Search"); search_btn.clicked.connect(self.start_search)
+        self.garbage_btn = QToolButton(); self.garbage_btn.setText("Find Bad Photos")
+        self.garbage_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.garbage_btn.setToolTip("Find the worst photos: Dark, Blurry, Overexposed, or All")
+        gmenu = QMenu(self.garbage_btn)
+        for kind, label in (("all", "All Bad"), ("dark", "Dark"), ("blurry", "Blurry"), ("overexposed", "Overexposed")):
+            act = gmenu.addAction(f"Find {label} Photos")
+            act.triggered.connect(lambda checked=False, k=kind: self.next_garbage_page(k))
+        self.garbage_btn.setMenu(gmenu)
         search_layout.addWidget(self.search_input); search_layout.addWidget(search_btn); search_layout.addWidget(self.garbage_btn); layout.addLayout(search_layout)
         bottom_layout = QHBoxLayout(); self.progress_bar = QProgressBar(); self.progress_bar.setVisible(False); self.progress_bar.setTextVisible(True)
         self.stop_index_btn = QPushButton("Stop Indexing"); self.stop_index_btn.setVisible(False); self.stop_index_btn.clicked.connect(self.cancel_current_operation)
@@ -1497,6 +2016,7 @@ class PhotoOrganizerWindow(QMainWindow):
         if not self.has_jdupes: self.dupes_action.setEnabled(False); self.dupes_action.setToolTip("jdupes is not installed")
         toolbar.addAction(self.dupes_action)
         clean_action = QAction("Clean Database", self); clean_action.setToolTip("Remove entries for files that no longer exist"); clean_action.triggered.connect(self.clean_database); toolbar.addAction(clean_action)
+        tune_action = QAction("Search Tuning\u2026", self); tune_action.setToolTip("Adjust search-accuracy and photo-quality thresholds"); tune_action.triggered.connect(self.open_settings); toolbar.addAction(tune_action)
         clear_action = QAction("Clear Screen", self); clear_action.setToolTip("Clear search results and reset UI"); clear_action.triggered.connect(self.clear_screen); toolbar.addAction(clear_action)
 
     def setup_shortcuts(self) -> None:
@@ -1689,20 +2209,31 @@ class PhotoOrganizerWindow(QMainWindow):
         self.search_worker = SearchWorker(self.searcher, query); self.search_worker.result.connect(self.display_results)
         self.search_worker.finished.connect(self.search_worker.deleteLater); self.search_worker.start()
 
-    def next_garbage_page(self) -> None:
+    def next_garbage_page(self, kind: str = "all") -> None:
+        if getattr(self, "_garbage_kind", None) != kind:
+            self._garbage_kind = kind; self._garbage_page = 0
         page = getattr(self, "_garbage_page", 0)
         self.searcher._garbage_offset = page * 50
         self._garbage_page = page + 1
-        self.find_garbage()
-        self.garbage_btn.setText("Find 50 More Bad Photos")
+        self.find_garbage(kind)
 
-    def find_garbage(self) -> None:
-        self.list_widget.clear(); self._path_to_item.clear(); self.statusBar().showMessage("Scanning metadata for bad photos...")
+    def find_garbage(self, kind: str = "all") -> None:
+        self.list_widget.clear(); self._path_to_item.clear()
+        self.statusBar().showMessage(f"Scanning metadata for {kind} photos...")
         if self.garbage_worker is not None:
             try: self.garbage_worker.result.disconnect(self.display_results)
             except (RuntimeError, TypeError): pass
-        self.garbage_worker = GarbageWorker(self.searcher); self.garbage_worker.result.connect(self.display_results)
+        self.garbage_worker = GarbageWorker(self.searcher, kind); self.garbage_worker.result.connect(self.display_results)
         self.garbage_worker.finished.connect(self.garbage_worker.deleteLater); self.garbage_worker.start()
+
+    def open_settings(self) -> None:
+        dialog = SettingsDialog(self.searcher, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._show_temp_status("Thresholds updated.")
+            if self.search_input.text().strip():
+                self.start_search()
+            elif getattr(self, "_garbage_kind", None):
+                self.find_garbage(self._garbage_kind)
 
     def display_results(self, hits: List[Dict[str, Any]], warnings: Optional[List[str]] = None) -> None:
         self.list_widget.clear(); self._path_to_item.clear(); self.current_results = hits
@@ -1715,10 +2246,12 @@ class PhotoOrganizerWindow(QMainWindow):
 
             if hit.get('is_garbage'):
                 meta = self.searcher.image_metadata.get(path, {})
+                kind = hit.get('kind', 'all')
                 tooltip = (
                     f"{os.path.basename(path)}\n"
                     f"Size: {self._format_file_size(path)}\n"
-                    f"[BADNESS {score:.2f}] lum_p95={meta.get('lum_p95', -1):.1f}, lap_p95={meta.get('lap_p95', -1):.1f}"
+                    f"[{kind.upper()} {score:.2f}] lum_p95={meta.get('lum_p95', -1):.1f}, "
+                    f"lap_p95={meta.get('lap_p95', -1):.1f}, mean_lum={meta.get('mean_lum', -1):.1f}"
                 )
             else:
                 tooltip = f"{os.path.basename(path)}\nSize: {self._format_file_size(path)}\nScore: {score:.3f}"
@@ -1763,24 +2296,39 @@ if __name__ == "__main__":
     parser.add_argument("--index", type=str, help="Directory to index"); parser.add_argument("--search", type=str, help="Search query")
     parser.add_argument("--reindex", action="store_true", help="Clear index"); parser.add_argument("--top", type=int, default=5, help="Results count")
     parser.add_argument("--find-garbage", action="store_true", help="Find low quality images")
+    parser.add_argument("--find-dark", action="store_true", help="Find dark images")
+    parser.add_argument("--find-blurry", action="store_true", help="Find blurry images")
+    parser.add_argument("--find-overexposed", action="store_true", help="Find overexposed images")
+    parser.add_argument("--floor", type=float, help="Absolute cosine-similarity floor for search")
+    parser.add_argument("--floor-ratio", type=float, dest="floor_ratio", help="Relevance floor as a fraction of the best hit")
+    parser.add_argument("--dedupe-cos", type=float, dest="dedupe_cos", help="Near-duplicate suppression cutoff for search")
     parser.add_argument("--purge-junk", action="store_true", help="Remove non-photo directory entries from index")
     args, _ = parser.parse_known_args()
     cache_path = Path.home() / ".cache" / "photofind"
-    
-    if args.index or args.search or args.find_garbage or args.purge_junk:
+    find_kinds = [k for k, flag in (("dark", args.find_dark), ("blurry", args.find_blurry),
+                                    ("overexposed", args.find_overexposed)) if flag]
+    find_garbage = args.find_garbage or bool(find_kinds)
+
+    if args.index or args.search or find_garbage or args.purge_junk:
         # CLI Mode
         searcher = PhotoSearch()
         if args.reindex:
             for p in [cache_path / "photo_index.json", cache_path / "photo_embeddings.pt", cache_path / "photo_metadata.json"]:
                 if p.exists(): p.unlink()
         searcher.load_index()
+        overrides = {k: v for k, v in (("floor_min", args.floor), ("floor_ratio", args.floor_ratio),
+                                       ("dedupe_cos", args.dedupe_cos)) if v is not None}
+        if overrides: searcher.save_settings(search=overrides)
         if args.index: searcher.index_photos(args.index)
         elif args.purge_junk:
             removed = searcher.purge_fragment_entries()
             print(f"Removed {removed} entries matching {INDEX_EXCLUDE_FRAGMENTS}. New index size: {len(searcher.image_paths)}")
-        elif args.find_garbage:
-            hits = searcher.get_garbage_photos(); print(f"\nFound {len(hits)} low quality images:")
-            for h in hits: print(f"[Garbage] {h['file']}")
+        elif find_garbage:
+            kinds = find_kinds or ["all"]
+            for kind in kinds:
+                hits = searcher.get_problem_photos(kind, 0, 50)
+                print(f"\nFound {len(hits)} {kind} images:")
+                for h in hits: print(f"[{kind} {h['score']:.2f}] {h['file']}")
         elif args.search:
             hits = searcher.search(args.search, top_k=args.top); print(f"\nTop {args.top} results for '{args.search}':")
             for h in hits: print(f"[Score: {h['score']:.3f}] {h['file']}")

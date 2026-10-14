@@ -10,8 +10,10 @@ The goal of photofind is to tame a massive, disorganized photo collection taken 
 *   **100% Local & Private:** No cloud uploads. All AI processing happens on your own CPU or GPU hardware.
 *   **Self-Optimizing Engine:** Automatically calibrates to your specific GPU VRAM and adjusts batch sizes dynamically to prevent crashes and maximize speed.
 *   **Hardware Acceleration:** Automatically detects and utilizes NVIDIA CUDA-capable GPUs.
-*   **Duplicate Management:** If `jdupes` is installed, a dedicated "Duplicate Manager" helps you find and remove redundant files.
-*   **Quality Control:** Includes a "Find Bad Photos" feature to detect blurry, dark, or low-quality images.
+*   **Duplicate Management:** If `jdupes` is installed, a dedicated "Duplicate Manager" helps you find and remove redundant files. Duplicate sets are ranked so the best copy (from your real library rather than a downloads/temp folder) is kept.
+*   **Folder Copy Detection:** The Duplicate Manager's "Duplicate Folders" view groups folders that share duplicates (mirrors/subsets) and can merge one folder into another or drop a redundant folder. Only PhotoFind-indexed images are touched; other files are left alone.
+*   **Quality Control:** Split "Find Bad Photos" filters for **Dark**, **Blurry**, and **Overexposed** images (plus All Bad), each paged 50 at a time.
+*   **Search Tuning:** A "Search Tuning…" dialog exposes live-adjustable search-accuracy thresholds (max results, relevance floors, near-duplicate cutoff, candidate pool) and photo-quality thresholds, saved to `~/.cache/photofind/settings.json`.
 
 ## What is CLIP?
 
