@@ -28,6 +28,9 @@ import tempfile
 import random
 import logging
 import warnings
+import re
+import shlex
+import configparser
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set, Tuple, Callable
 from PIL import Image, ImageOps
@@ -42,7 +45,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QToolBar, QHBoxLayout, QPushButton,
     QMenu, QDialog, QAbstractItemView, QFrame, QProgressBar,
     QToolButton, QTabWidget, QDoubleSpinBox, QSpinBox, QFormLayout,
-    QGroupBox, QDialogButtonBox, QInputDialog
+    QGroupBox, QDialogButtonBox, QInputDialog, QComboBox
 )
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QAction, QKeySequence, QShortcut, QDesktopServices
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint, QTimer, QLibraryInfo, QLoggingCategory
@@ -63,6 +66,98 @@ DEFAULT_SEARCH_SETTINGS: Dict[str, Any] = {
     "candidate_mult": 40,   # candidate pool multiplier (advanced)
     "black_lum_p95": 10.0,  # hide near-black photos at/below this luminance
 }
+
+DEFAULT_VIEWER_SETTINGS: Dict[str, Any] = {
+    "image_viewer": "system",  # "system" = desktop default; else a command line
+}
+
+# Geeqie always launches windowed unless told otherwise; it is single-instance,
+# so handing it a file reuses the open window. Add its fullscreen-start flag.
+GEEQIE_EXTRA_ARGS: List[str] = ["--fullscreen"]
+
+
+# --- Dynamic image-viewer discovery ---------------------------------------
+# We discover installed applications from freedesktop .desktop entries rather
+# than hard-coding a list, so anything registered to open image/* shows up.
+
+_DESKTOP_FIELD_CODES = re.compile(r"%[fFuUdDnNickvm]")
+
+
+def _application_dirs() -> List[str]:
+    """Standard directories that hold .desktop application entries."""
+    dirs: List[str] = []
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    dirs.append(os.path.join(data_home, "applications"))
+    data_dirs = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    for base in data_dirs.split(":"):
+        if base:
+            dirs.append(os.path.join(base, "applications"))
+    dirs += [
+        os.path.expanduser("~/.local/share/flatpak/exports/share/applications"),
+        "/var/lib/flatpak/exports/share/applications",
+        "/var/lib/snapd/desktop/applications",
+    ]
+    seen: Set[str] = set(); out: List[str] = []
+    for d in dirs:
+        if d not in seen and os.path.isdir(d):
+            seen.add(d); out.append(d)
+    return out
+
+
+def _clean_desktop_exec(exec_line: str) -> str:
+    """Turn a .desktop Exec line into a launch command (field codes removed).
+
+    Drops leading ``env``/``VAR=value`` wrappers so the result starts with the
+    real executable. The path to open is appended by the caller.
+    """
+    parts = shlex.split(_DESKTOP_FIELD_CODES.sub(" ", exec_line))
+    if parts and os.path.basename(parts[0]) == "env":
+        parts = parts[1:]
+        while parts and "=" in parts[0]:
+            parts = parts[1:]
+    return " ".join(parts)
+
+
+def _find_executable(command: str) -> bool:
+    """True if the command's executable can be resolved (PATH or absolute)."""
+    try:
+        exe = shlex.split(command)[0]
+    except (ValueError, IndexError):
+        return False
+    return bool(shutil.which(exe) or (os.path.isabs(exe) and os.path.exists(exe)))
+
+
+def detect_image_viewers() -> List[Tuple[str, str]]:
+    """Return (command, label) for installed apps that open image/* files.
+
+    Derived from freedesktop .desktop entries, newest-namespace entries win.
+    """
+    found: Dict[str, str] = {}
+    for d in _application_dirs():
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for fn in names:
+            if not fn.endswith(".desktop"): continue
+            try:
+                cp = configparser.ConfigParser(interpolation=None, strict=False)
+                cp.read(os.path.join(d, fn), encoding="utf-8")
+                sec = cp["Desktop Entry"]
+            except (configparser.Error, KeyError, OSError, UnicodeDecodeError):
+                continue
+            if sec.get("Type", "Application") != "Application": continue
+            if sec.getboolean("Hidden", fallback=False) or sec.getboolean("NoDisplay", fallback=False):
+                continue
+            mimes = sec.get("MimeType", "")
+            if not any(tok.startswith("image/") for tok in mimes.split(";")):
+                continue
+            exec_line = sec.get("Exec")
+            if not exec_line: continue
+            command = _clean_desktop_exec(exec_line)
+            if not command or not _find_executable(command): continue
+            found.setdefault(command, sec.get("Name") or shlex.split(command)[0])
+    return sorted(found.items(), key=lambda kv: (kv[1].lower(), kv[0]))
 
 DEFAULT_QUALITY_SETTINGS: Dict[str, Any] = {
     "dark_lum_p95": 25.0, "dark_span": 25.0,
@@ -219,6 +314,7 @@ class PhotoSearch:
         self.settings_file = self.cache_dir / "settings.json"
         self.search_settings: Dict[str, Any] = dict(DEFAULT_SEARCH_SETTINGS)
         self.quality_settings: Dict[str, Any] = dict(DEFAULT_QUALITY_SETTINGS)
+        self.viewer_settings: Dict[str, Any] = dict(DEFAULT_VIEWER_SETTINGS)
         self._load_settings()
 
         self.image_paths, self.image_embeddings, self.image_metadata, self.indexed_set = [], None, {}, set()
@@ -239,18 +335,23 @@ class PhotoSearch:
                     if k in self.search_settings: self.search_settings[k] = v
                 for k, v in (data.get("quality") or {}).items():
                     if k in self.quality_settings: self.quality_settings[k] = v
+                for k, v in (data.get("viewer") or {}).items():
+                    if k in self.viewer_settings: self.viewer_settings[k] = v
         except Exception as e:
             logging.warning(f"Could not read settings: {type(e).__name__}: {e}. Using defaults.")
 
     def save_settings(self, search: Optional[Dict[str, Any]] = None,
-                      quality: Optional[Dict[str, Any]] = None) -> None:
-        """Persist the given (partial) search/quality threshold updates."""
+                      quality: Optional[Dict[str, Any]] = None,
+                      viewer: Optional[Dict[str, Any]] = None) -> None:
+        """Persist the given (partial) search/quality/viewer settings updates."""
         if search: self.search_settings.update(search)
         if quality: self.quality_settings.update(quality)
+        if viewer: self.viewer_settings.update(viewer)
         try:
             tmp = str(self.settings_file) + ".tmp"
             with open(tmp, "w") as f:
-                json.dump({"search": self.search_settings, "quality": self.quality_settings}, f, indent=2)
+                json.dump({"search": self.search_settings, "quality": self.quality_settings,
+                           "viewer": self.viewer_settings}, f, indent=2)
             os.replace(tmp, str(self.settings_file))
         except Exception as e:
             logging.warning(f"Could not save settings: {type(e).__name__}: {e}")
@@ -1223,17 +1324,19 @@ class PhotoSearch:
         lum_p95 = meta.get("lum_p95")
         return lum_p95 is not None and lum_p95 <= float(s.get("black_lum_p95", 10.0))
 
-    def get_problem_photos(self, kind: str = "all", offset: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_problem_photos(self, kind: str = "all", offset: int = 0, limit: int = 50,
+                           q: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Worst photos for a problem `kind` (dark/blurry/overexposed/all), worst first.
 
         Always returns the worst-ranked photos (even when none cross the absolute
         cutoff) so the filters stay useful on libraries with no obvious offenders.
-        Entries past the cutoff are flagged with `below_threshold`.
+        Entries past the cutoff are flagged with `below_threshold`. ``q`` supplies
+        candidate quality thresholds (for live previews) instead of the saved ones.
         """
         scored = []
         for p, m in self.image_metadata.items():
             if m.get('deleted'): continue
-            sev = self._problem_severity(kind, m)
+            sev = self._problem_severity(kind, m, q)
             if sev is not None: scored.append((sev, p))
         scored.sort(reverse=True)
         total = len(scored)
@@ -1470,6 +1573,16 @@ class QualityPreviewWorker(QThread):
     def run(self):
         try: self.done.emit(self.searcher.count_problem_photos(q=self.settings))
         except Exception: self.done.emit({})
+
+
+class QualityPhotoPreviewWorker(QThread):
+    """Returns the worst photos for one kind under candidate quality thresholds."""
+    result = pyqtSignal(list)
+    def __init__(self, searcher: PhotoSearch, kind: str, settings: Dict[str, Any]):
+        super().__init__(); self.searcher, self.kind, self.settings = searcher, kind, dict(settings)
+    def run(self):
+        try: self.result.emit(self.searcher.get_problem_photos(self.kind, 0, 50, q=self.settings))
+        except Exception: self.result.emit([])
 
 
 class CleanWorker(QThread):
@@ -1864,17 +1977,22 @@ class SettingsDialog(QDialog):
         self.searcher = searcher
         self.setWindowTitle("Search Tuning"); self.resize(580, 600)
         self._quality_worker = None
+        self._last_counts: Dict[str, int] = {}
+        self._last_preview: Optional[int] = None
         self._search_timer = QTimer(self); self._search_timer.setSingleShot(True); self._search_timer.setInterval(350)
         self._search_timer.timeout.connect(self._run_search_preview)
         self._quality_timer = QTimer(self); self._quality_timer.setSingleShot(True); self._quality_timer.setInterval(350)
         self._quality_timer.timeout.connect(self._run_quality_preview)
-        # Live search previews render in the main window, not just a count label.
+        # Live previews render in the main window, not just a count label.
         if parent is not None and hasattr(parent, "preview_results"):
             parent.preview_results.connect(self._on_search_preview)
+        if parent is not None and hasattr(parent, "quality_preview_results"):
+            parent.quality_preview_results.connect(self._on_quality_photos_preview)
 
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget(); layout.addWidget(self.tabs)
         self._build_search_tab(); self._build_quality_tab()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         btns = QDialogButtonBox()
         reset_btn = btns.addButton("Reset to Defaults", QDialogButtonBox.ButtonRole.ResetRole)
@@ -1959,15 +2077,22 @@ class SettingsDialog(QDialog):
         self.sp_mirror = self._make_d(float(q["folder_mirror_coverage"]), 0.0, 1.0, 0.01, 2)
         fform.addRow("Folder mirror coverage:", self.sp_mirror)
         form.addRow(folders)
+        self.preview_kind_combo = QComboBox()
+        for value, label in (("all", "All Bad"), ("dark", "Dark"), ("blurry", "Blurry"),
+                             ("overexposed", "Overexposed"), ("blank", "Blank / Solid")):
+            self.preview_kind_combo.addItem(label, value)
+        form.addRow("Preview in main window:", self.preview_kind_combo)
         self.quality_preview = QLabel("\u2014")
         self.quality_preview.setFrameStyle(QFrame.Shape.Panel | QFrame.Shadow.Sunken); self.quality_preview.setMargin(5)
         form.addRow("Live preview:", self.quality_preview)
         self.tabs.addTab(tab, "Quality")
+        self._quality_tab_index = self.tabs.count() - 1
         for w in (self.sp_dark, self.sp_dark_span, self.sp_blur, self.sp_blur_span,
                   self.sp_blur_min_edge, self.sp_blank_std, self.sp_blank_span,
                   self.sp_over_lum, self.sp_over_lum_span, self.sp_over_mean,
                   self.sp_over_mean_span, self.sp_mirror):
             w.valueChanged.connect(self._queue_quality_preview)
+        self.preview_kind_combo.currentIndexChanged.connect(self._queue_quality_preview)
 
     def _collect_search(self) -> Dict[str, Any]:
         return {"top_k": int(self.sp_top_k.value()), "floor_min": float(self.sp_floor_min.value()),
@@ -1986,18 +2111,26 @@ class SettingsDialog(QDialog):
     def _queue_search_preview(self, *_args: Any) -> None: self._search_timer.start()
     def _queue_quality_preview(self, *_args: Any) -> None: self._quality_timer.start()
 
+    def _on_tab_changed(self, index: int) -> None:
+        # Preview the relevant tab in the main window when it becomes active, so
+        # merely opening the dialog never clobbers the current results.
+        if index == getattr(self, "_quality_tab_index", -1):
+            self._queue_quality_preview()
+        else:
+            self._queue_search_preview()
+
     def _run_search_preview(self) -> None:
         query = self.q_input.text().strip()
         if self.searcher.image_embeddings is None:
             self.search_preview.setText("No index loaded."); return
         if not query:
-            self.search_preview.setText("Enter a query to preview."); return
+            self.search_preview.setText("\u2014"); return
         parent = self.parent()
         if parent is not None and hasattr(parent, "preview_search"):
             self.search_preview.setText("Previewing in main window\u2026")
             parent.preview_search(query, self._collect_search())
         else:
-            self.search_preview.setText("Enter a query to preview.")
+            self.search_preview.setText("\u2014")
 
     def _on_search_preview(self, count: int, top: float) -> None:
         self.search_preview.setText(f"\u2248{count} photo(s) shown in main window  \u2022  top score {top:.3f}")
@@ -2007,19 +2140,42 @@ class SettingsDialog(QDialog):
         if parent is not None and hasattr(parent, "preview_results"):
             try: parent.preview_results.disconnect(self._on_search_preview)
             except (RuntimeError, TypeError): pass
+        if parent is not None and hasattr(parent, "quality_preview_results"):
+            try: parent.quality_preview_results.disconnect(self._on_quality_photos_preview)
+            except (RuntimeError, TypeError): pass
         super().done(code)
 
     def _run_quality_preview(self) -> None:
+        q = self._collect_quality()
         self.quality_preview.setText("Counting\u2026")
-        w = QualityPreviewWorker(self.searcher, self._collect_quality())
+        w = QualityPreviewWorker(self.searcher, q)
         self._quality_worker = w; w.done.connect(self._on_quality_preview); w.finished.connect(w.deleteLater); w.start()
+        # Only drive the main window from the Quality tab, so opening the dialog
+        # to tune search does not replace the current results.
+        parent = self.parent()
+        if (parent is not None and hasattr(parent, "preview_problem_photos")
+                and self.tabs.currentIndex() == getattr(self, "_quality_tab_index", -1)):
+            self._last_preview = None
+            parent.preview_problem_photos(str(self.preview_kind_combo.currentData()), q)
 
     def _on_quality_preview(self, counts: Dict[str, int]) -> None:
-        if not counts:
-            self.quality_preview.setText("No metadata loaded yet."); return
-        self.quality_preview.setText(
-            f"dark {counts.get('dark', 0)}  \u2022  blurry {counts.get('blurry', 0)}  "
-            f"\u2022  overexposed {counts.get('overexposed', 0)}  \u2022  blank {counts.get('blank', 0)}")
+        self._last_counts = counts or {}
+        self._refresh_quality_label()
+
+    def _on_quality_photos_preview(self, count: int) -> None:
+        self._last_preview = count
+        self._refresh_quality_label()
+
+    def _refresh_quality_label(self) -> None:
+        c = self._last_counts
+        if c:
+            text = (f"dark {c.get('dark', 0)}  \u2022  blurry {c.get('blurry', 0)}  "
+                    f"\u2022  overexposed {c.get('overexposed', 0)}  \u2022  blank {c.get('blank', 0)}")
+        else:
+            text = "No metadata loaded yet."
+        if self._last_preview is not None:
+            text += f"   \u2014   showing {self._last_preview} \u00d7 {self.preview_kind_combo.currentText()} in main window"
+        self.quality_preview.setText(text)
 
     def _reset_defaults(self) -> None:
         s, q = DEFAULT_SEARCH_SETTINGS, DEFAULT_QUALITY_SETTINGS
@@ -2033,6 +2189,8 @@ class SettingsDialog(QDialog):
         self.sp_over_lum.setValue(float(q["over_lum_p95"])); self.sp_over_lum_span.setValue(float(q["over_lum_span"]))
         self.sp_over_mean.setValue(float(q["over_mean_lum"])); self.sp_over_mean_span.setValue(float(q["over_mean_span"]))
         self.sp_mirror.setValue(float(q["folder_mirror_coverage"]))
+        idx = self.preview_kind_combo.findData("all")
+        if idx >= 0: self.preview_kind_combo.setCurrentIndex(idx)
         self._queue_search_preview(); self._queue_quality_preview()
 
     def _apply(self) -> None:
@@ -2042,6 +2200,7 @@ class SettingsDialog(QDialog):
 
 class PhotoOrganizerWindow(QMainWindow):
     preview_results = pyqtSignal(int, float)
+    quality_preview_results = pyqtSignal(int)
 
     def __init__(self):
         super().__init__()
@@ -2051,9 +2210,11 @@ class PhotoOrganizerWindow(QMainWindow):
         self.setup_ui(); self.setup_menu(); self.setup_shortcuts()
         self.statusBar().showMessage("Loading AI Model... (this may take a moment)"); QApplication.processEvents()
         self.searcher = PhotoSearch()
+        self._sync_viewer_combo()
         self.current_results, self.thumb_worker, self.dupes_worker, self.dupes_dialog = [], None, None, None
         self.index_worker, self.search_worker, self.garbage_worker, self.clean_worker = None, None, None, None
         self._preview_worker = None
+        self._quality_preview_worker = None
         self._path_to_item = {}
         
         self._is_indexing = False
@@ -2128,6 +2289,35 @@ class PhotoOrganizerWindow(QMainWindow):
         clean_action = QAction("Clean Database", self); clean_action.setToolTip("Remove entries for files that no longer exist"); clean_action.triggered.connect(self.clean_database); toolbar.addAction(clean_action)
         tune_action = QAction("Search Tuning\u2026", self); tune_action.setToolTip("Adjust search-accuracy and photo-quality thresholds"); tune_action.triggered.connect(self.open_settings); toolbar.addAction(tune_action)
         clear_action = QAction("Clear Screen", self); clear_action.setToolTip("Clear search results and reset UI"); clear_action.triggered.connect(self.clear_screen); toolbar.addAction(clear_action)
+
+        # Image-viewer selector: dynamically populated from installed desktop
+        # apps. Selecting one persists it so opened photos use that viewer.
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel(" Open with: "))
+        self.viewer_combo = QComboBox(); self.viewer_combo.setToolTip("Application used to open a photo (double-click / Enter)")
+        self.viewer_combo.addItem("System default", "system")
+        for cmd, label in detect_image_viewers():
+            self.viewer_combo.addItem(label, cmd)
+        self.viewer_combo.setMinimumWidth(160)
+        self.viewer_combo.currentIndexChanged.connect(self._on_viewer_changed)
+        toolbar.addWidget(self.viewer_combo)
+
+    def _on_viewer_changed(self, index: int) -> None:
+        cmd = str(self.viewer_combo.itemData(index) or "system")
+        if getattr(self, "searcher", None) is None: return
+        self.searcher.save_settings(viewer={"image_viewer": cmd})
+        self._show_temp_status(f"Photos will open with {self.viewer_combo.itemText(index)}.")
+
+    def _sync_viewer_combo(self) -> None:
+        """Select the persisted viewer in the toolbar combo (adding it if needed)."""
+        cmd = str(self.searcher.viewer_settings.get("image_viewer", "system"))
+        idx = self.viewer_combo.findData(cmd)
+        if idx < 0 and cmd != "system":
+            self.viewer_combo.addItem(f"Custom  ({cmd})", cmd); idx = self.viewer_combo.count() - 1
+        if idx >= 0:
+            self.viewer_combo.blockSignals(True)
+            self.viewer_combo.setCurrentIndex(idx)
+            self.viewer_combo.blockSignals(False)
 
     def setup_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+F"), self, self.search_input.setFocus)
@@ -2240,43 +2430,57 @@ class PhotoOrganizerWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Failed to exclude folder: {e}")
 
+    def _launch_image_viewer(self, command: str, path: str) -> bool:
+        """Launch ``command`` on ``path`` detached from this process.
+
+        ``command`` may be a full command line (e.g. ``flatpak run org.x.Y``);
+        the photo path is appended. Returns True if the process was started.
+        The viewer is put in its own session so it keeps running if PhotoFind
+        is closed.
+        """
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = [command]
+        # Geeqie needs an explicit flag to start full screen; it is
+        # single-instance, so an already-open window reuses/replaces its
+        # contents when handed a new file.
+        if "geeqie" in command.lower():
+            argv = [*argv, *GEEQIE_EXTRA_ARGS]
+        argv = [*argv, path]
+        try:
+            subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            return True
+        except Exception as e:
+            logging.warning(f"Failed to launch image viewer {command!r}: {type(e).__name__}: {e}")
+            return False
+
     def open_image_viewer(self, path: str) -> None:
         err = self.searcher._check_file_access(path)
         if err: self._show_temp_status(err); return
 
-        # DETECT BROKEN ENVIRONMENT
-        # If we are on the specific Qt version that crashes KIO, we bypass it.
-        qt_version = QLibraryInfo.version().toString()
-        is_broken_kde = (qt_version == "6.10.3")
+        # 1) User's explicitly chosen viewer (Settings -> Viewers).
+        choice = str(self.searcher.viewer_settings.get("image_viewer", "system"))
+        if choice and choice != "system":
+            if self._launch_image_viewer(choice, path):
+                return
+            self._show_temp_status(f"Could not launch '{choice}'; trying system default.")
 
-        if is_broken_kde:
-            # STRATEGY: Direct Launch
-            # Try common Linux image viewers in order of preference.
-            # This bypasses the Qt KIO worker crash.
-            viewers = [
-                'okular',      # KDE (Robust)
-                'loupe',       # Modern, fast (Rust)
-                'nomacs',      # Lightweight Qt
-                'feh',         # Very fast X11
-                'ristretto',   # XFCE
-                'eog',         # GNOME
-                'gwenview'     # KDE standard (User prefers others)
-            ]
-            
-            for viewer in viewers:
-                if shutil.which(viewer):
-                    try:
-                        subprocess.Popen([viewer, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        return
-                    except Exception:
-                        continue
-            
-            # If no direct viewer found, we have to use the system default and accept the crash risk
-            logging.warning("No common image viewer found. Falling back to system default (may crash).")
-        
-        # STRATEGY: Standard Qt (Only on Stable Qt versions)
-        # This respects your system preferences (like "Always open with X").
+        # 2) System default.
+        # On the Qt version whose KIO worker crashes, bypass the desktop
+        # association and open a detected viewer directly.
+        if QLibraryInfo.version().toString() == "6.10.3":
+            for cmd, _label in detect_image_viewers():
+                if self._launch_image_viewer(cmd, path):
+                    return
+            logging.warning("No image viewer found. Falling back to system default (may crash).")
+
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            # Desktop association refused; try a detected viewer directly.
+            for cmd, _label in detect_image_viewers():
+                if self._launch_image_viewer(cmd, path):
+                    return
             self._show_temp_status("Could not open image viewer.")
 
     def start_global_dedupe(self) -> None:
@@ -2369,7 +2573,7 @@ class PhotoOrganizerWindow(QMainWindow):
         # whether the user applied or cancelled a live preview.
         if self.search_input.text().strip():
             self.start_search()
-        elif getattr(self, "_garbage_kind", None) and accepted:
+        elif getattr(self, "_garbage_kind", None):
             self.find_garbage(self._garbage_kind)
 
     def preview_search(self, query: str, settings: Dict[str, Any]) -> None:
@@ -2387,11 +2591,32 @@ class PhotoOrganizerWindow(QMainWindow):
         self._preview_worker.finished.connect(self._preview_worker.deleteLater)
         self._preview_worker.start()
 
-    def display_results(self, hits: List[Dict[str, Any]], warnings: Optional[List[str]] = None) -> None:
+    def preview_problem_photos(self, kind: str, settings: Dict[str, Any]) -> None:
+        """Show the worst photos for `kind` under candidate quality thresholds in
+        the main window, without persisting the settings."""
+        if self._is_indexing or not self.searcher.image_metadata: return
+        if self._quality_preview_worker is not None:
+            try: self._quality_preview_worker.result.disconnect()
+            except (RuntimeError, TypeError): pass
+        # Remember the kind so the view is restored to real data when the
+        # tuning dialog closes.
+        self._garbage_kind = kind; self._garbage_page = 0; self.searcher._garbage_offset = 0
+        self.statusBar().showMessage(f"Previewing {kind} photos with tuning\u2026")
+        self._quality_preview_worker = QualityPhotoPreviewWorker(self.searcher, kind, settings)
+        self._quality_preview_worker.result.connect(self._on_quality_photos)
+        self._quality_preview_worker.finished.connect(self._quality_preview_worker.deleteLater)
+        self._quality_preview_worker.start()
+
+    def _on_quality_photos(self, hits: List[Dict[str, Any]]) -> None:
+        self.display_results(hits, emit_preview=False)
+        self.quality_preview_results.emit(len(hits))
+
+    def display_results(self, hits: List[Dict[str, Any]], warnings: Optional[List[str]] = None,
+                        emit_preview: bool = True) -> None:
         self.list_widget.clear(); self._path_to_item.clear(); self.current_results = hits
         warn_suffix = f" Warning: {'; '.join(warnings)}" if warnings else ""
         top_score = hits[0].get('score', 0.0) if hits else 0.0
-        self.preview_results.emit(len(hits), float(top_score))
+        if emit_preview: self.preview_results.emit(len(hits), float(top_score))
         if not hits:
             self._show_temp_status(f"No results found.{warn_suffix}" if warnings else "No results found."); return
         self.statusBar().showMessage(f"Found {len(hits)} results. Loading thumbnails...{warn_suffix}"); paths_to_load = []

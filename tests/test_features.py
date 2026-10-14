@@ -12,6 +12,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("photofind", _ROOT / "photofind.py")
@@ -207,6 +208,104 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(s.search_settings["top_k"], 12)
         self.assertEqual(s.quality_settings["dark_lum_p95"], 3.0)
         self.assertEqual(s.search_settings["floor_min"], pf.DEFAULT_SEARCH_SETTINGS["floor_min"])
+
+    def test_viewer_setting_roundtrip(self):
+        s = bare_searcher()
+        s.viewer_settings = dict(pf.DEFAULT_VIEWER_SETTINGS)
+        tmp = tempfile.mkdtemp()
+        s.settings_file = Path(tmp) / "settings.json"
+        s.save_settings(viewer={"image_viewer": "gwenview"})
+        with open(s.settings_file) as f:
+            data = json.load(f)
+        self.assertEqual(data["viewer"]["image_viewer"], "gwenview")
+        # Reload into a fresh object and confirm it is restored.
+        s2 = bare_searcher()
+        s2.viewer_settings = dict(pf.DEFAULT_VIEWER_SETTINGS)
+        s2.settings_file = s.settings_file
+        s2._load_settings()
+        self.assertEqual(s2.viewer_settings["image_viewer"], "gwenview")
+
+
+class ViewerDetectionTest(unittest.TestCase):
+    """detect_image_viewers() derives its list from .desktop entries, so we
+    point it at a temporary applications directory rather than the real system.
+    """
+
+    def _desktop(self, appdir, filename, *, name, mimes, exec_line, hidden=False):
+        body = [f"[Desktop Entry]", "Type=Application", f"Name={name}",
+                f"Exec={exec_line}", f"MimeType={mimes}"]
+        if hidden:
+            body.append("Hidden=true")
+        with open(os.path.join(appdir, filename), "w") as f:
+            f.write("\n".join(body) + "\n")
+
+    def test_detects_image_apps_and_skips_others(self):
+        tmp = tempfile.mkdtemp()
+        home = os.path.join(tmp, "home"); ad = os.path.join(home, "applications")
+        data = os.path.join(tmp, "data"); ad2 = os.path.join(data, "applications")
+        os.makedirs(ad); os.makedirs(ad2)
+        # Resolvable executable that exists on all Linux systems.
+        self.assertEqual(pf._find_executable("/bin/true"), True)
+        self._desktop(ad, "imgy.desktop", name="ImgY", mimes="image/jpeg;image/png;",
+                      exec_line="/bin/true %U")
+        # A non-image app must not appear.
+        self._desktop(ad, "text.desktop", name="TextY", mimes="text/plain;",
+                      exec_line="/bin/true %U")
+        # A hidden image app must not appear.
+        self._desktop(ad2, "hidden.desktop", name="HiddenY", mimes="image/png;",
+                      exec_line="/bin/true %U", hidden=True)
+        # env-wrapped Exec should resolve to the real executable.
+        self._desktop(ad2, "envimg.desktop", name="EnvY", mimes="image/png;",
+                      exec_line="env GTK_THEME=x /bin/echo %U")
+
+        env = {"XDG_DATA_HOME": home, "XDG_DATA_DIRS": data}
+        with mock.patch.dict(os.environ, env, clear=False):
+            viewers = pf.detect_image_viewers()
+
+        self.assertIsInstance(viewers, list)
+        for item in viewers:
+            self.assertIsInstance(item, tuple)
+            self.assertEqual(len(item), 2)
+            self.assertIsInstance(item[0], str); self.assertIsInstance(item[1], str)
+        labels = {label for _cmd, label in viewers}
+        self.assertIn("ImgY", labels)
+        self.assertIn("EnvY", labels)
+        self.assertNotIn("TextY", labels)
+        self.assertNotIn("HiddenY", labels)
+        # Every returned command must be launchable.
+        for cmd, _label in viewers:
+            self.assertTrue(pf._find_executable(cmd), f"{cmd!r} not resolvable")
+
+
+class ViewerLaunchTest(unittest.TestCase):
+    """The launcher special-cases Geeqie (fullscreen start, single-instance)."""
+
+    def _launch(self, command, path="/tmp/pic.jpg"):
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs): captured["argv"] = argv
+
+        with mock.patch.object(pf.subprocess, "Popen", FakePopen):
+            ok = pf.PhotoOrganizerWindow._launch_image_viewer(None, command, path)
+        return ok, captured.get("argv")
+
+    def test_geeqie_gets_fullscreen_flag(self):
+        ok, argv = self._launch("geeqie")
+        self.assertTrue(ok)
+        self.assertEqual(argv, ["geeqie", "--fullscreen", "/tmp/pic.jpg"])
+
+    def test_geeqie_matched_case_and_path_insensitively(self):
+        ok, argv = self._launch("/usr/bin/geeqie")
+        self.assertEqual(argv, ["/usr/bin/geeqie", "--fullscreen", "/tmp/pic.jpg"])
+
+    def test_other_viewer_unmodified(self):
+        ok, argv = self._launch("feh")
+        self.assertEqual(argv, ["feh", "/tmp/pic.jpg"])
+
+    def test_viewer_with_args_keeps_args_then_appends_path(self):
+        ok, argv = self._launch("flatpak run org.example.View")
+        self.assertEqual(argv, ["flatpak", "run", "org.example.View", "/tmp/pic.jpg"])
 
 
 if __name__ == "__main__":
