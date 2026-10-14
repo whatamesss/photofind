@@ -7,6 +7,10 @@ Requirements: torch, transformers, PyQt6, Pillow, jdupes (optional)
 import os
 # Configure CUDA memory allocator before importing torch
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Silence benign KDE/KIO noise emitted by the native (KDE) folder chooser:
+# "kf.kio.widgets.kdirmodel: No node found for item that was just removed".
+# Must be set before Qt/KIO initialize their logging rules.
+os.environ.setdefault("QT_LOGGING_RULES", "kf.kio.widgets.kdirmodel=false")
 
 import sys
 import shutil
@@ -38,10 +42,10 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QToolBar, QHBoxLayout, QPushButton,
     QMenu, QDialog, QAbstractItemView, QFrame, QProgressBar,
     QToolButton, QTabWidget, QDoubleSpinBox, QSpinBox, QFormLayout,
-    QGroupBox, QDialogButtonBox
+    QGroupBox, QDialogButtonBox, QInputDialog
 )
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QAction, QKeySequence, QShortcut, QDesktopServices
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint, QTimer, QLibraryInfo
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint, QTimer, QLibraryInfo, QLoggingCategory
 
 # Suppress SDPA warnings on older GPUs (e.g., GTX 1050Ti)
 warnings.filterwarnings("ignore", message="Torch was not compiled with memory efficient attention")
@@ -1009,10 +1013,26 @@ class PhotoSearch:
             return self._embeddings_on_gpu
 
     def _check_file_access(self, path: str) -> Optional[str]:
+        """Return None if `path` is readable, else a human-readable reason."""
         if os.path.exists(path): return None
-        p, existing_parent = Path(path), Path(path)
-        while not existing_parent.exists() and existing_parent != Path('/'): existing_parent = existing_parent.parent
-        if any(existing_parent.is_relative_to(m) for m in ('/run/media', '/media', '/mnt')): return f"Filesystem {existing_parent} not available, please mount"
+        p = Path(path)
+        removable_roots = ('/run/media', '/media', '/mnt')
+        root = next((Path(m) for m in removable_roots if p.is_relative_to(m)), None)
+        if root is not None:
+            # Walk down the removable root looking for an actual mountpoint. A
+            # mounted drive means the file was deleted/moved; an unmounted one
+            # (no mountpoint found) means the drive is disconnected.
+            mounted = os.path.ismount(root)
+            candidate = root
+            try: rel_parts = p.relative_to(root).parts
+            except ValueError: rel_parts = ()
+            for part in rel_parts:
+                candidate = candidate / part
+                try:
+                    if candidate.exists() and os.path.ismount(candidate): mounted = True
+                except OSError: pass
+            if not mounted:
+                return f"Filesystem under {root} not mounted (drive may be disconnected)"
         return "File not found"
 
     def search(self, query: str, top_k: Optional[int] = None,
@@ -1122,12 +1142,43 @@ class PhotoSearch:
         """Badness in [0, 2]: 0 = healthy; near-black and/or blurry raises it."""
         return self._darkness(meta) + self._blur(meta)
 
+    def _problem_severity(self, kind: str, meta: Dict[str, Any],
+                          q: Optional[Dict[str, Any]] = None) -> Optional[float]:
+        """Unclipped severity for a problem kind: >0 means past the cutoff,
+        larger = worse, <=0 = healthier. Spans normalise the kinds so they are
+        loosely comparable. Returns None when the needed metadata is missing."""
+        q = self.quality_settings if q is None else q
+        sev: Optional[float] = None
+
+        def bump(v: float) -> None:
+            nonlocal sev
+            sev = v if sev is None else max(sev, v)
+
+        if kind in ("dark", "all"):
+            lum_p95 = meta.get("lum_p95")
+            if lum_p95 is not None:
+                bump((float(q.get("dark_lum_p95", 25.0)) - float(lum_p95))
+                     / max(1e-6, float(q.get("dark_span", 25.0))))
+        if kind in ("blurry", "all"):
+            lap_p95 = meta.get("lap_p95")
+            if lap_p95 is not None:
+                bump((float(q.get("blur_lap_p95", 12.0)) - float(lap_p95))
+                     / max(1e-6, float(q.get("blur_span", 10.0))))
+        if kind in ("overexposed", "all"):
+            lum_p95 = meta.get("lum_p95")
+            if lum_p95 is not None:
+                bump((float(lum_p95) - float(q.get("over_lum_p95", 235.0)))
+                     / max(1e-6, float(q.get("over_lum_span", 20.0))))
+            mean_lum = meta.get("mean_lum")
+            if mean_lum is not None:
+                bump((float(mean_lum) - float(q.get("over_mean_lum", 200.0)))
+                     / max(1e-6, float(q.get("over_mean_span", 55.0))))
+        return sev
+
     def _problem_score(self, kind: str, meta: Dict[str, Any],
                        q: Optional[Dict[str, Any]] = None) -> float:
-        if kind == "dark": return self._darkness(meta, q)
-        if kind == "blurry": return self._blur(meta, q)
-        if kind == "overexposed": return self._overexposure(meta, q)
-        return max(self._darkness(meta, q), self._blur(meta, q), self._overexposure(meta, q))
+        sev = self._problem_severity(kind, meta, q)
+        return 0.0 if sev is None else max(0.0, min(1.0, sev))
 
     def _is_garbage(self, meta: Dict[str, Any]) -> bool:
         return self._badness(meta) >= 1.5
@@ -1139,21 +1190,28 @@ class PhotoSearch:
         return lum_p95 is not None and lum_p95 <= float(s.get("black_lum_p95", 10.0))
 
     def get_problem_photos(self, kind: str = "all", offset: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
-        """Worst photos for a problem `kind` (dark/blurry/overexposed/all), highest first."""
+        """Worst photos for a problem `kind` (dark/blurry/overexposed/all), worst first.
+
+        Always returns the worst-ranked photos (even when none cross the absolute
+        cutoff) so the filters stay useful on libraries with no obvious offenders.
+        Entries past the cutoff are flagged with `below_threshold`.
+        """
         scored = []
         for p, m in self.image_metadata.items():
             if m.get('deleted'): continue
-            sc = self._problem_score(kind, m)
-            if sc > 0.0: scored.append((sc, p))
+            sev = self._problem_severity(kind, m)
+            if sev is not None: scored.append((sev, p))
         scored.sort(reverse=True)
         total = len(scored)
         if total: offset %= total
         out = []
-        for sc, p in scored:
+        for sev, p in scored:
             if len(out) >= limit: break
             if offset > 0: offset -= 1; continue
             if self._check_file_access(p) is None:
-                out.append({"file": p, "score": round(sc, 2), "is_garbage": True, "kind": kind})
+                out.append({"file": p, "score": round(max(0.0, min(1.0, sev)), 2),
+                            "severity": round(sev, 3), "below_threshold": sev <= 0.0,
+                            "is_garbage": True, "kind": kind})
         return out
 
     def get_garbage_photos(self, offset: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
@@ -1342,15 +1400,17 @@ class SearchWorker(QThread):
     def __init__(
         self,
         searcher: PhotoSearch,
-        query: str
+        query: str,
+        settings: Optional[Dict[str, Any]] = None
     ):
         super().__init__()
         self.searcher = searcher
         self.query = query
+        self.settings = None if settings is None else dict(settings)
 
     def run(self):
         try:
-            hits = self.searcher.search(self.query)
+            hits = self.searcher.search(self.query, settings=self.settings)
             self.result.emit(hits, list(self.searcher.last_search_warnings))
         except Exception as e:
             logging.exception(
@@ -1366,20 +1426,6 @@ class GarbageWorker(QThread):
         super().__init__(); self.searcher, self.kind = searcher, kind
     def run(self):
         self.result.emit(self.searcher.get_problem_photos(self.kind, getattr(self.searcher, "_garbage_offset", 0)))
-
-
-class SearchPreviewWorker(QThread):
-    """Non-mutating re-run of a query with candidate search thresholds."""
-    done = pyqtSignal(int, float)
-    def __init__(self, searcher: PhotoSearch, query: str, settings: Dict[str, Any]):
-        super().__init__(); self.searcher, self.query, self.settings = searcher, query, dict(settings)
-    def run(self):
-        try:
-            results = self.searcher.search(self.query, settings=self.settings) if self.query.strip() else []
-            top = results[0]["score"] if results else 0.0
-            self.done.emit(len(results), float(top))
-        except Exception as e:
-            logging.warning(f"Search preview failed: {type(e).__name__}: {e}"); self.done.emit(0, 0.0)
 
 
 class QualityPreviewWorker(QThread):
@@ -1783,11 +1829,14 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.searcher = searcher
         self.setWindowTitle("Search Tuning"); self.resize(580, 600)
-        self._search_worker = None; self._quality_worker = None
+        self._quality_worker = None
         self._search_timer = QTimer(self); self._search_timer.setSingleShot(True); self._search_timer.setInterval(350)
         self._search_timer.timeout.connect(self._run_search_preview)
         self._quality_timer = QTimer(self); self._quality_timer.setSingleShot(True); self._quality_timer.setInterval(350)
         self._quality_timer.timeout.connect(self._run_quality_preview)
+        # Live search previews render in the main window, not just a count label.
+        if parent is not None and hasattr(parent, "preview_results"):
+            parent.preview_results.connect(self._on_search_preview)
 
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget(); layout.addWidget(self.tabs)
@@ -1898,12 +1947,22 @@ class SettingsDialog(QDialog):
             self.search_preview.setText("No index loaded."); return
         if not query:
             self.search_preview.setText("Enter a query to preview."); return
-        self.search_preview.setText("Counting\u2026")
-        w = SearchPreviewWorker(self.searcher, query, self._collect_search())
-        self._search_worker = w; w.done.connect(self._on_search_preview); w.finished.connect(w.deleteLater); w.start()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "preview_search"):
+            self.search_preview.setText("Previewing in main window\u2026")
+            parent.preview_search(query, self._collect_search())
+        else:
+            self.search_preview.setText("Enter a query to preview.")
 
     def _on_search_preview(self, count: int, top: float) -> None:
-        self.search_preview.setText(f"\u2248{count} photo(s) match  \u2022  top score {top:.3f}")
+        self.search_preview.setText(f"\u2248{count} photo(s) shown in main window  \u2022  top score {top:.3f}")
+
+    def done(self, code: int) -> None:
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "preview_results"):
+            try: parent.preview_results.disconnect(self._on_search_preview)
+            except (RuntimeError, TypeError): pass
+        super().done(code)
 
     def _run_quality_preview(self) -> None:
         self.quality_preview.setText("Counting\u2026")
@@ -1935,6 +1994,8 @@ class SettingsDialog(QDialog):
 
 
 class PhotoOrganizerWindow(QMainWindow):
+    preview_results = pyqtSignal(int, float)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PhotoFind"); self.resize(1200, 800)
@@ -1945,6 +2006,7 @@ class PhotoOrganizerWindow(QMainWindow):
         self.searcher = PhotoSearch()
         self.current_results, self.thumb_worker, self.dupes_worker, self.dupes_dialog = [], None, None, None
         self.index_worker, self.search_worker, self.garbage_worker, self.clean_worker = None, None, None, None
+        self._preview_worker = None
         self._path_to_item = {}
         
         self._is_indexing = False
@@ -2071,7 +2133,7 @@ class PhotoOrganizerWindow(QMainWindow):
             path = selected_items[0].data(Qt.ItemDataRole.UserRole)
             menu.addAction("Open in Image Viewer").triggered.connect(lambda: self.open_image_viewer(path))
             menu.addAction("Open in File Browser").triggered.connect(lambda: open_in_file_browser(path))
-            menu.addAction("Exclude Parent Folder from Index").triggered.connect(lambda: self.exclude_parent_folder(path))
+            menu.addAction("Exclude Folder from Index\u2026").triggered.connect(lambda: self.exclude_folder_dialog(path))
             menu.addSeparator()
         delete_action = menu.addAction(f"Move {selected_count} Photos to Trash" if selected_count > 1 else "Move to Trash")
         delete_action.triggered.connect(lambda: self.delete_photos_action([i.data(Qt.ItemDataRole.UserRole) for i in selected_items], selected_items))
@@ -2091,9 +2153,34 @@ class PhotoOrganizerWindow(QMainWindow):
             if fail: QMessageBox.warning(self, "Error", f"Could not move {len(fail)} files to trash.")
             else: self._show_temp_status(f"Moved {count} photos to Trash.")
 
-    def exclude_parent_folder(self, path: str) -> None:
-        folder = os.path.dirname(os.path.realpath(path))
-        count = sum(1 for p in self.searcher.image_paths if p.startswith(folder + os.sep))
+    def _indexed_count_under(self, folder: str) -> int:
+        prefix = folder.rstrip(os.sep) + os.sep
+        return sum(1 for p in self.searcher.image_paths if p.startswith(prefix))
+
+    def exclude_folder_dialog(self, path: str) -> None:
+        """Let the user pick which ancestor folder to exclude (e.g. ~/music),
+        not just the file's immediate parent."""
+        start = Path(os.path.realpath(path)).parent
+        ancestors = []
+        node = start
+        while True:
+            ancestors.append(node)
+            if node.parent == node: break
+            node = node.parent
+        labels, folders = [], []
+        for anc in ancestors:
+            folder = str(anc)
+            count = self._indexed_count_under(folder)
+            labels.append(f"{folder}    ({count} indexed photo{'' if count == 1 else 's'})")
+            folders.append(folder)
+        if not folders: return
+        choice, ok = QInputDialog.getItem(
+            self, "Exclude Folder from Index",
+            "Choose the folder to exclude (its subfolders are excluded too):",
+            labels, 0, False)
+        if not ok or not choice: return
+        folder = folders[labels.index(choice)]
+        count = self._indexed_count_under(folder)
         msg = (f"Exclude this folder from the index?\n\n{folder}\n\n"
                f"{count} indexed photo(s) will be removed now. Future indexing will skip "
                f"this folder and all its subfolders.")
@@ -2228,16 +2315,35 @@ class PhotoOrganizerWindow(QMainWindow):
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.searcher, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self._show_temp_status("Thresholds updated.")
-            if self.search_input.text().strip():
-                self.start_search()
-            elif getattr(self, "_garbage_kind", None):
-                self.find_garbage(self._garbage_kind)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if accepted: self._show_temp_status("Thresholds updated.")
+        # Re-run with the (saved) settings so the main window reflects reality
+        # whether the user applied or cancelled a live preview.
+        if self.search_input.text().strip():
+            self.start_search()
+        elif getattr(self, "_garbage_kind", None) and accepted:
+            self.find_garbage(self._garbage_kind)
+
+    def preview_search(self, query: str, settings: Dict[str, Any]) -> None:
+        """Run a query with candidate search thresholds and show it live in the
+        main window, without persisting the settings."""
+        query = (query or "").strip()
+        if not query or self.searcher.image_embeddings is None or self._is_indexing: return
+        self.list_widget.clear(); self._path_to_item.clear()
+        self.statusBar().showMessage("Previewing search with tuning\u2026")
+        if self._preview_worker is not None:
+            try: self._preview_worker.result.disconnect()
+            except (RuntimeError, TypeError): pass
+        self._preview_worker = SearchWorker(self.searcher, query, settings=settings)
+        self._preview_worker.result.connect(self.display_results)
+        self._preview_worker.finished.connect(self._preview_worker.deleteLater)
+        self._preview_worker.start()
 
     def display_results(self, hits: List[Dict[str, Any]], warnings: Optional[List[str]] = None) -> None:
         self.list_widget.clear(); self._path_to_item.clear(); self.current_results = hits
         warn_suffix = f" Warning: {'; '.join(warnings)}" if warnings else ""
+        top_score = hits[0].get('score', 0.0) if hits else 0.0
+        self.preview_results.emit(len(hits), float(top_score))
         if not hits:
             self._show_temp_status(f"No results found.{warn_suffix}" if warnings else "No results found."); return
         self.statusBar().showMessage(f"Found {len(hits)} results. Loading thumbnails...{warn_suffix}"); paths_to_load = []
@@ -2247,11 +2353,12 @@ class PhotoOrganizerWindow(QMainWindow):
             if hit.get('is_garbage'):
                 meta = self.searcher.image_metadata.get(path, {})
                 kind = hit.get('kind', 'all')
+                note = "  (below cutoff \u2014 among the worst available)" if hit.get('below_threshold') else ""
                 tooltip = (
                     f"{os.path.basename(path)}\n"
                     f"Size: {self._format_file_size(path)}\n"
                     f"[{kind.upper()} {score:.2f}] lum_p95={meta.get('lum_p95', -1):.1f}, "
-                    f"lap_p95={meta.get('lap_p95', -1):.1f}, mean_lum={meta.get('mean_lum', -1):.1f}"
+                    f"lap_p95={meta.get('lap_p95', -1):.1f}, mean_lum={meta.get('mean_lum', -1):.1f}{note}"
                 )
             else:
                 tooltip = f"{os.path.basename(path)}\nSize: {self._format_file_size(path)}\nScore: {score:.3f}"
@@ -2335,6 +2442,10 @@ if __name__ == "__main__":
     else:
         # GUI Mode
         app = QApplication(sys.argv)
+        # Silence benign KDE/KIO "No node found for item that was just removed"
+        # spam from the native (KDE) folder chooser.
+        try: QLoggingCategory.setFilterRules("kf.kio.widgets.kdirmodel=false")
+        except Exception: pass
         if args.reindex:
             for p in [cache_path / "photo_index.json", cache_path / "photo_embeddings.pt", cache_path / "photo_metadata.json"]:
                 if p.exists(): p.unlink()

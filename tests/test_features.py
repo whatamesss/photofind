@@ -74,8 +74,43 @@ class QualityScorersTest(unittest.TestCase):
         counts = s.count_problem_photos()
         self.assertEqual(counts["dark"], 1)
         hits = s.get_problem_photos("dark")
-        self.assertEqual([h["file"] for h in hits], [dark])
+        self.assertEqual([h["file"] for h in hits], [dark, bright])
         self.assertEqual(hits[0]["kind"], "dark")
+        self.assertFalse(hits[0]["below_threshold"])
+        self.assertTrue(hits[1]["below_threshold"])
+
+    def test_problem_photos_never_empty_when_photos_exist(self):
+        # Even with no photo past the cutoff, the worst-ranked photo is returned
+        # so the filters stay useful instead of appearing broken.
+        s = bare_searcher()
+        tmp = tempfile.mkdtemp()
+        paths = []
+        for i in range(3):
+            p = os.path.join(tmp, f"p{i}.jpg")
+            with open(p, "w") as f:
+                f.write("x")
+            paths.append(p)
+        s.image_paths = list(paths)
+        s.indexed_set = set(paths)
+        s.image_metadata = {
+            paths[0]: {"lum_p95": 150.0, "lap_p95": 120.0, "mean_lum": 140.0},
+            paths[1]: {"lum_p95": 160.0, "lap_p95": 100.0, "mean_lum": 135.0},
+            paths[2]: {"lum_p95": 170.0, "lap_p95": 140.0, "mean_lum": 150.0},
+        }
+        self.assertEqual(s.count_problem_photos()["blurry"], 0)
+        hits = s.get_problem_photos("blurry")
+        self.assertEqual(len(hits), 3)
+        self.assertTrue(all(h["below_threshold"] for h in hits))
+        # lowest lap_p95 is worst / first
+        self.assertEqual(hits[0]["file"], paths[1])
+
+    def test_problem_severity_ordering(self):
+        s = bare_searcher()
+        self.assertGreater(s._problem_severity("dark", {"lum_p95": 0.0}),
+                           s._problem_severity("dark", {"lum_p95": 20.0}))
+        self.assertGreater(s._problem_severity("overexposed", {"lum_p95": 255.0}),
+                           s._problem_severity("overexposed", {"lum_p95": 240.0}))
+        self.assertIsNone(s._problem_severity("blurry", {"lum_p95": 50.0}))
 
 
 class DuplicateRankingTest(unittest.TestCase):
