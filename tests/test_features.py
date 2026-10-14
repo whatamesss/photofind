@@ -41,8 +41,19 @@ class QualityScorersTest(unittest.TestCase):
 
     def test_blur(self):
         s = bare_searcher()
-        self.assertAlmostEqual(s._blur({"lap_p95": 0.0}), 1.0)
-        self.assertEqual(s._blur({"lap_p95": 50.0}), 0.0)
+        # Featureless frames (low edge / blank) are never "blurry".
+        self.assertEqual(s._blur({"lap_var": 0.0, "std_dev": 0.0}), 0.0)
+        self.assertEqual(s._blur({"lap_var": 0.0, "edge_score": 0.5, "std_dev": 20.0}), 0.0)
+        # A photo with real content: low Laplacian variance = blurry.
+        self.assertGreater(s._blur({"lap_var": 0.0, "edge_score": 20.0, "std_dev": 40.0}), 0.0)
+        self.assertEqual(s._blur({"lap_var": 5000.0, "edge_score": 20.0, "std_dev": 40.0}), 0.0)
+
+    def test_blank(self):
+        s = bare_searcher()
+        self.assertAlmostEqual(s._blankness({"std_dev": 0.0}), 1.0)
+        self.assertEqual(s._blankness({"std_dev": 50.0}), 0.0)
+        self.assertTrue(s._is_blank({"std_dev": 0.0}))
+        self.assertFalse(s._is_blank({"std_dev": 40.0}))
 
     def test_overexposure(self):
         s = bare_searcher()
@@ -93,16 +104,37 @@ class QualityScorersTest(unittest.TestCase):
         s.image_paths = list(paths)
         s.indexed_set = set(paths)
         s.image_metadata = {
-            paths[0]: {"lum_p95": 150.0, "lap_p95": 120.0, "mean_lum": 140.0},
-            paths[1]: {"lum_p95": 160.0, "lap_p95": 100.0, "mean_lum": 135.0},
-            paths[2]: {"lum_p95": 170.0, "lap_p95": 140.0, "mean_lum": 150.0},
+            paths[0]: {"lum_p95": 150.0, "lap_var": 100.0, "edge_score": 20.0, "std_dev": 40.0, "mean_lum": 140.0},
+            paths[1]: {"lum_p95": 160.0, "lap_var": 30.0, "edge_score": 20.0, "std_dev": 40.0, "mean_lum": 135.0},
+            paths[2]: {"lum_p95": 170.0, "lap_var": 50.0, "edge_score": 20.0, "std_dev": 40.0, "mean_lum": 150.0},
         }
         self.assertEqual(s.count_problem_photos()["blurry"], 0)
         hits = s.get_problem_photos("blurry")
         self.assertEqual(len(hits), 3)
         self.assertTrue(all(h["below_threshold"] for h in hits))
-        # lowest lap_p95 is worst / first
+        # lowest lap_var is worst / first
         self.assertEqual(hits[0]["file"], paths[1])
+
+    def test_blank_frames_not_counted_as_blurry(self):
+        s = bare_searcher()
+        tmp = tempfile.mkdtemp()
+        blank = os.path.join(tmp, "blank.jpg")
+        photo = os.path.join(tmp, "photo.jpg")
+        for p in (blank, photo):
+            with open(p, "w") as f:
+                f.write("x")
+        s.image_paths = [blank, photo]
+        s.indexed_set = set(s.image_paths)
+        s.image_metadata = {
+            blank: {"lum_p95": 128.0, "lap_var": 0.0, "edge_score": 0.0, "std_dev": 0.0, "mean_lum": 128.0},
+            photo: {"lum_p95": 128.0, "lap_var": 500.0, "edge_score": 30.0, "std_dev": 45.0, "mean_lum": 128.0},
+        }
+        # The solid frame is blank, never blurry.
+        self.assertEqual(s._blur(s.image_metadata[blank]), 0.0)
+        self.assertEqual(s.count_problem_photos()["blurry"], 0)
+        blank_hits = s.get_problem_photos("blank")
+        self.assertEqual(blank_hits[0]["file"], blank)
+        self.assertNotIn(blank, [h["file"] for h in s.get_problem_photos("blurry", 0, 1) if h["score"] > 0])
 
     def test_problem_severity_ordering(self):
         s = bare_searcher()

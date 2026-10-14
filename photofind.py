@@ -66,7 +66,12 @@ DEFAULT_SEARCH_SETTINGS: Dict[str, Any] = {
 
 DEFAULT_QUALITY_SETTINGS: Dict[str, Any] = {
     "dark_lum_p95": 25.0, "dark_span": 25.0,
-    "blur_lap_p95": 12.0, "blur_span": 10.0,
+    # Blur is measured by the variance of the Laplacian (lap_var); images with
+    # almost no edges (edge_score <= blur_min_edge) are featureless and are not
+    # judged for blur at all.
+    "blur_lap_var": 20.0, "blur_span": 30.0, "blur_min_edge": 2.0,
+    # Blank/solid-colour frames: near-zero pixel variation (std_dev).
+    "blank_std_max": 2.5, "blank_span": 2.5,
     "over_lum_p95": 235.0, "over_lum_span": 20.0,
     "over_mean_lum": 200.0, "over_mean_span": 55.0,
     "folder_mirror_coverage": 0.90,
@@ -1117,13 +1122,35 @@ class PhotoSearch:
         cut = float(q.get("dark_lum_p95", 25.0)); span = max(1e-6, float(q.get("dark_span", 25.0)))
         return max(0.0, min(1.0, (cut - lum_p95) / span))
 
-    def _blur(self, meta: Dict[str, Any], q: Optional[Dict[str, Any]] = None) -> float:
-        """[0,1] blur: 1 when the 95th-percentile Laplacian is far below the cutoff."""
+    def _is_blank(self, meta: Dict[str, Any], q: Optional[Dict[str, Any]] = None) -> bool:
+        """True for (near) solid-colour / featureless frames (std_dev ~ 0)."""
         q = self.quality_settings if q is None else q
-        lap_p95 = meta.get("lap_p95")
-        if lap_p95 is None: return 0.0
-        cut = float(q.get("blur_lap_p95", 12.0)); span = max(1e-6, float(q.get("blur_span", 10.0)))
-        return max(0.0, min(1.0, (cut - lap_p95) / span))
+        std = meta.get("std_dev")
+        return std is not None and std <= float(q.get("blank_std_max", 2.5))
+
+    def _is_featureless(self, meta: Dict[str, Any], q: Optional[Dict[str, Any]] = None) -> bool:
+        """True when there is too little edge content to judge blur at all."""
+        q = self.quality_settings if q is None else q
+        edge = meta.get("edge_score")
+        return edge is not None and edge <= float(q.get("blur_min_edge", 2.0))
+
+    def _blur(self, meta: Dict[str, Any], q: Optional[Dict[str, Any]] = None) -> float:
+        """[0,1] blur from the variance of the Laplacian; featureless frames are
+        excluded (they are blank, not blurry)."""
+        q = self.quality_settings if q is None else q
+        if self._is_blank(meta, q) or self._is_featureless(meta, q): return 0.0
+        lap_var = meta.get("lap_var")
+        if lap_var is None: return 0.0
+        cut = float(q.get("blur_lap_var", 20.0)); span = max(1e-6, float(q.get("blur_span", 30.0)))
+        return max(0.0, min(1.0, (cut - lap_var) / span))
+
+    def _blankness(self, meta: Dict[str, Any], q: Optional[Dict[str, Any]] = None) -> float:
+        """[0,1] blankness: 1 for a solid-colour frame, 0 once variation is normal."""
+        q = self.quality_settings if q is None else q
+        std = meta.get("std_dev")
+        if std is None: return 0.0
+        cut = float(q.get("blank_std_max", 2.5)); span = max(1e-6, float(q.get("blank_span", 5.0)))
+        return max(0.0, min(1.0, (cut - std) / span))
 
     def _overexposure(self, meta: Dict[str, Any], q: Optional[Dict[str, Any]] = None) -> float:
         """[0,1] overexposure from blown highlights and/or a high mean luminance."""
@@ -1160,10 +1187,17 @@ class PhotoSearch:
                 bump((float(q.get("dark_lum_p95", 25.0)) - float(lum_p95))
                      / max(1e-6, float(q.get("dark_span", 25.0))))
         if kind in ("blurry", "all"):
-            lap_p95 = meta.get("lap_p95")
-            if lap_p95 is not None:
-                bump((float(q.get("blur_lap_p95", 12.0)) - float(lap_p95))
-                     / max(1e-6, float(q.get("blur_span", 10.0))))
+            lap_var = meta.get("lap_var")
+            # Featureless/blank frames have no edges to blur, so they are never
+            # counted as "blurry" (they belong to the blank category instead).
+            if lap_var is not None and not (self._is_blank(meta, q) or self._is_featureless(meta, q)):
+                bump((float(q.get("blur_lap_var", 20.0)) - float(lap_var))
+                     / max(1e-6, float(q.get("blur_span", 30.0))))
+        if kind in ("blank", "all"):
+            std = meta.get("std_dev")
+            if std is not None:
+                bump((float(q.get("blank_std_max", 2.5)) - float(std))
+                     / max(1e-6, float(q.get("blank_span", 5.0))))
         if kind in ("overexposed", "all"):
             lum_p95 = meta.get("lum_p95")
             if lum_p95 is not None:
@@ -1217,7 +1251,7 @@ class PhotoSearch:
     def get_garbage_photos(self, offset: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
         return self.get_problem_photos("all", offset, limit)
 
-    def count_problem_photos(self, kinds: Tuple[str, ...] = ("dark", "blurry", "overexposed"),
+    def count_problem_photos(self, kinds: Tuple[str, ...] = ("dark", "blurry", "overexposed", "blank"),
                              q: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
         """Count indexed photos flagged by each problem kind under (candidate) thresholds."""
         counts = {k: 0 for k in kinds}
@@ -1898,11 +1932,19 @@ class SettingsDialog(QDialog):
         dform.addRow("Darkness span:", self.sp_dark_span)
         form.addRow(dark)
         blur = QGroupBox("Blurry"); bform = QFormLayout(blur)
-        self.sp_blur = self._make_d(float(q["blur_lap_p95"]), 0.0, 255.0, 0.5, 2)
-        self.sp_blur_span = self._make_d(float(q["blur_span"]), 0.5, 255.0, 0.5, 2)
-        bform.addRow("Blur cutoff (lap_p95 below):", self.sp_blur)
+        self.sp_blur = self._make_d(float(q["blur_lap_var"]), 0.0, 5000.0, 1.0, 1)
+        self.sp_blur_span = self._make_d(float(q["blur_span"]), 0.5, 5000.0, 1.0, 1)
+        self.sp_blur_min_edge = self._make_d(float(q["blur_min_edge"]), 0.0, 100.0, 0.5, 1)
+        bform.addRow("Blur cutoff (lap_var below):", self.sp_blur)
         bform.addRow("Blur span:", self.sp_blur_span)
+        bform.addRow("Ignore frames with edges below:", self.sp_blur_min_edge)
         form.addRow(blur)
+        blank = QGroupBox("Blank / solid colour"); kform = QFormLayout(blank)
+        self.sp_blank_std = self._make_d(float(q["blank_std_max"]), 0.0, 100.0, 0.5, 1)
+        self.sp_blank_span = self._make_d(float(q["blank_span"]), 0.5, 100.0, 0.5, 1)
+        kform.addRow("Blank cutoff (std_dev below):", self.sp_blank_std)
+        kform.addRow("Blank span:", self.sp_blank_span)
+        form.addRow(blank)
         over = QGroupBox("Overexposed"); oform = QFormLayout(over)
         self.sp_over_lum = self._make_d(float(q["over_lum_p95"]), 100.0, 255.0, 1.0, 1)
         self.sp_over_lum_span = self._make_d(float(q["over_lum_span"]), 1.0, 255.0, 1.0, 1)
@@ -1922,6 +1964,7 @@ class SettingsDialog(QDialog):
         form.addRow("Live preview:", self.quality_preview)
         self.tabs.addTab(tab, "Quality")
         for w in (self.sp_dark, self.sp_dark_span, self.sp_blur, self.sp_blur_span,
+                  self.sp_blur_min_edge, self.sp_blank_std, self.sp_blank_span,
                   self.sp_over_lum, self.sp_over_lum_span, self.sp_over_mean,
                   self.sp_over_mean_span, self.sp_mirror):
             w.valueChanged.connect(self._queue_quality_preview)
@@ -1933,7 +1976,9 @@ class SettingsDialog(QDialog):
 
     def _collect_quality(self) -> Dict[str, Any]:
         return {"dark_lum_p95": float(self.sp_dark.value()), "dark_span": float(self.sp_dark_span.value()),
-                "blur_lap_p95": float(self.sp_blur.value()), "blur_span": float(self.sp_blur_span.value()),
+                "blur_lap_var": float(self.sp_blur.value()), "blur_span": float(self.sp_blur_span.value()),
+                "blur_min_edge": float(self.sp_blur_min_edge.value()),
+                "blank_std_max": float(self.sp_blank_std.value()), "blank_span": float(self.sp_blank_span.value()),
                 "over_lum_p95": float(self.sp_over_lum.value()), "over_lum_span": float(self.sp_over_lum_span.value()),
                 "over_mean_lum": float(self.sp_over_mean.value()), "over_mean_span": float(self.sp_over_mean_span.value()),
                 "folder_mirror_coverage": float(self.sp_mirror.value())}
@@ -1974,7 +2019,7 @@ class SettingsDialog(QDialog):
             self.quality_preview.setText("No metadata loaded yet."); return
         self.quality_preview.setText(
             f"dark {counts.get('dark', 0)}  \u2022  blurry {counts.get('blurry', 0)}  "
-            f"\u2022  overexposed {counts.get('overexposed', 0)}")
+            f"\u2022  overexposed {counts.get('overexposed', 0)}  \u2022  blank {counts.get('blank', 0)}")
 
     def _reset_defaults(self) -> None:
         s, q = DEFAULT_SEARCH_SETTINGS, DEFAULT_QUALITY_SETTINGS
@@ -1982,7 +2027,9 @@ class SettingsDialog(QDialog):
         self.sp_floor_ratio.setValue(float(s["floor_ratio"])); self.sp_dedupe.setValue(float(s["dedupe_cos"]))
         self.sp_cand.setValue(int(s["candidate_mult"])); self.sp_black.setValue(float(s["black_lum_p95"]))
         self.sp_dark.setValue(float(q["dark_lum_p95"])); self.sp_dark_span.setValue(float(q["dark_span"]))
-        self.sp_blur.setValue(float(q["blur_lap_p95"])); self.sp_blur_span.setValue(float(q["blur_span"]))
+        self.sp_blur.setValue(float(q["blur_lap_var"])); self.sp_blur_span.setValue(float(q["blur_span"]))
+        self.sp_blur_min_edge.setValue(float(q["blur_min_edge"]))
+        self.sp_blank_std.setValue(float(q["blank_std_max"])); self.sp_blank_span.setValue(float(q["blank_span"]))
         self.sp_over_lum.setValue(float(q["over_lum_p95"])); self.sp_over_lum_span.setValue(float(q["over_lum_span"]))
         self.sp_over_mean.setValue(float(q["over_mean_lum"])); self.sp_over_mean_span.setValue(float(q["over_mean_span"]))
         self.sp_mirror.setValue(float(q["folder_mirror_coverage"]))
@@ -2143,9 +2190,10 @@ class PhotoOrganizerWindow(QMainWindow):
         search_btn = QPushButton("Search"); search_btn.clicked.connect(self.start_search)
         self.garbage_btn = QToolButton(); self.garbage_btn.setText("Find Bad Photos")
         self.garbage_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.garbage_btn.setToolTip("Find the worst photos: Dark, Blurry, Overexposed, or All")
+        self.garbage_btn.setToolTip("Find the worst photos: Dark, Blurry, Overexposed, Blank, or All")
         gmenu = QMenu(self.garbage_btn)
-        for kind, label in (("all", "All Bad"), ("dark", "Dark"), ("blurry", "Blurry"), ("overexposed", "Overexposed")):
+        for kind, label in (("all", "All Bad"), ("dark", "Dark"), ("blurry", "Blurry"),
+                            ("overexposed", "Overexposed"), ("blank", "Blank / Solid")):
             act = gmenu.addAction(f"Find {label} Photos")
             act.triggered.connect(lambda checked=False, k=kind: self.next_garbage_page(k))
         self.garbage_btn.setMenu(gmenu)
@@ -2430,7 +2478,8 @@ class PhotoOrganizerWindow(QMainWindow):
                     f"{os.path.basename(path)}\n"
                     f"Size: {self._format_file_size(path)}\n"
                     f"[{kind.upper()} {score:.2f}] lum_p95={meta.get('lum_p95', -1):.1f}, "
-                    f"lap_p95={meta.get('lap_p95', -1):.1f}, mean_lum={meta.get('mean_lum', -1):.1f}{note}"
+                    f"mean_lum={meta.get('mean_lum', -1):.1f}, "
+                    f"lap_var={meta.get('lap_var', -1):.1f}, std_dev={meta.get('std_dev', -1):.1f}{note}"
                 )
             else:
                 tooltip = f"{os.path.basename(path)}\nSize: {self._format_file_size(path)}\nScore: {score:.3f}"
