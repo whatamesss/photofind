@@ -68,12 +68,33 @@ DEFAULT_SEARCH_SETTINGS: Dict[str, Any] = {
 }
 
 DEFAULT_VIEWER_SETTINGS: Dict[str, Any] = {
-    "image_viewer": "system",  # "system" = desktop default; else a command line
+    "image_viewer": "gwenview",  # "system" = desktop default; else a command line
 }
 
-# Geeqie always launches windowed unless told otherwise; it is single-instance,
-# so handing it a file reuses the open window. Add its fullscreen-start flag.
+# Bumped when the default viewer changed from "system" to "gwenview"; used to
+# migrate settings files written before then.
+SETTINGS_VERSION = 2
+
+# Geeqie always launches windowed unless told otherwise; add its fullscreen
+# flag. PhotoFind also sets GQ_NEW_INSTANCE so each launch is a fresh window
+# (see _launch_image_viewer).
 GEEQIE_EXTRA_ARGS: List[str] = ["--fullscreen"]
+
+
+# Launched viewers are kept so we can reap them; when a viewer closes it would
+# otherwise linger as a defunct/zombie child, since nothing calls wait() on it.
+_VIEWER_PROCESSES: List["subprocess.Popen"] = []
+
+
+def reap_viewer_processes() -> None:
+    alive = []
+    for proc in _VIEWER_PROCESSES:
+        try:
+            if proc.poll() is None:
+                alive.append(proc)
+        except Exception:
+            pass
+    _VIEWER_PROCESSES[:] = alive
 
 
 # --- Dynamic image-viewer discovery ---------------------------------------
@@ -127,12 +148,63 @@ def _find_executable(command: str) -> bool:
     return bool(shutil.which(exe) or (os.path.isabs(exe) and os.path.exists(exe)))
 
 
-def detect_image_viewers() -> List[Tuple[str, str]]:
-    """Return (command, label) for installed apps that open image/* files.
+# Discovery is dynamic (only what is installed is listed), but restricted to
+# this set so generic image handlers (web browsers, office/drawing apps) that
+# merely register for image/* do not clutter the menu.
+_PHOTO_VIEWER_NAMES: Set[str] = {
+    # photo viewers
+    "gwenview", "geeqie", "gqview", "eog", "eom", "ristretto", "feh", "nomacs",
+    "mirage", "viewnior", "gpicview", "gthumb", "shotwell", "pix", "xviewer",
+    "lximage-qt", "qiv", "sxiv", "nsxiv", "loupe", "fim", "pqiv", "photoqt",
+    # editors, RAW processors and organizers
+    "gimp", "gimp-2.10", "gimp-2.99", "gimp-3.0", "krita", "darktable",
+    "rawtherapee", "luminance-hdr", "digikam", "showfoto",
+}
 
-    Derived from freedesktop .desktop entries, newest-namespace entries win.
+# Preferred order in the toolbar menu; anything else sorts after these.
+_VIEWER_PREFERENCE: List[str] = ["gwenview", "geeqie", "gimp"]
+
+
+def _photo_viewer_name(command: str) -> Optional[str]:
+    """Return the allow-listed viewer name for ``command``, or None.
+
+    Matches the executable's base name. For launchers such as Flatpak the app
+    id's final component is used (``flatpak run org.gnome.Loupe`` -> ``loupe``).
     """
-    found: Dict[str, str] = {}
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    exe = os.path.basename(parts[0]).lower()
+    if exe in _PHOTO_VIEWER_NAMES:
+        return exe
+    if exe in ("flatpak", "snap"):
+        for tok in parts[1:]:
+            if "." in tok:
+                candidate = tok.rsplit(".", 1)[-1].lower()
+                if candidate in _PHOTO_VIEWER_NAMES:
+                    return candidate
+    return None
+
+
+def _viewer_sort_key(name: str, label: str, command: str) -> Tuple[int, str, str]:
+    rank = len(_VIEWER_PREFERENCE)
+    for i, pref in enumerate(_VIEWER_PREFERENCE):
+        if name == pref or name.startswith(pref):
+            rank = i
+            break
+    return (rank, label.lower(), command)
+
+
+def detect_image_viewers() -> List[Tuple[str, str]]:
+    """Return (command, label) for installed photo viewers/editors.
+
+    Derived from freedesktop .desktop entries, newest-namespace entries win;
+    entries are restricted to known photo apps (see _PHOTO_VIEWER_NAMES).
+    """
+    found: Dict[str, Tuple[str, str]] = {}
     for d in _application_dirs():
         try:
             names = os.listdir(d)
@@ -156,8 +228,11 @@ def detect_image_viewers() -> List[Tuple[str, str]]:
             if not exec_line: continue
             command = _clean_desktop_exec(exec_line)
             if not command or not _find_executable(command): continue
-            found.setdefault(command, sec.get("Name") or shlex.split(command)[0])
-    return sorted(found.items(), key=lambda kv: (kv[1].lower(), kv[0]))
+            viewer_name = _photo_viewer_name(command)
+            if not viewer_name: continue
+            found.setdefault(command, (sec.get("Name") or shlex.split(command)[0], viewer_name))
+    return [(cmd, label) for cmd, (label, _name) in
+            sorted(found.items(), key=lambda kv: _viewer_sort_key(kv[1][1], kv[1][0], kv[0]))]
 
 DEFAULT_QUALITY_SETTINGS: Dict[str, Any] = {
     "dark_lum_p95": 25.0, "dark_span": 25.0,
@@ -337,6 +412,13 @@ class PhotoSearch:
                     if k in self.quality_settings: self.quality_settings[k] = v
                 for k, v in (data.get("viewer") or {}).items():
                     if k in self.viewer_settings: self.viewer_settings[k] = v
+                try: ver = int(data.get("version", 1))
+                except (TypeError, ValueError): ver = 1
+                if ver < SETTINGS_VERSION and self.viewer_settings.get("image_viewer") == "system":
+                    # "system" was only ever the old default; adopt the new one
+                    # and persist the migration so it does not repeat.
+                    self.viewer_settings["image_viewer"] = DEFAULT_VIEWER_SETTINGS["image_viewer"]
+                    self.save_settings()
         except Exception as e:
             logging.warning(f"Could not read settings: {type(e).__name__}: {e}. Using defaults.")
 
@@ -350,8 +432,9 @@ class PhotoSearch:
         try:
             tmp = str(self.settings_file) + ".tmp"
             with open(tmp, "w") as f:
-                json.dump({"search": self.search_settings, "quality": self.quality_settings,
-                           "viewer": self.viewer_settings}, f, indent=2)
+                json.dump({"version": SETTINGS_VERSION, "search": self.search_settings,
+                           "quality": self.quality_settings, "viewer": self.viewer_settings},
+                          f, indent=2)
             os.replace(tmp, str(self.settings_file))
         except Exception as e:
             logging.warning(f"Could not save settings: {type(e).__name__}: {e}")
@@ -2211,6 +2294,9 @@ class PhotoOrganizerWindow(QMainWindow):
         self.statusBar().showMessage("Loading AI Model... (this may take a moment)"); QApplication.processEvents()
         self.searcher = PhotoSearch()
         self._sync_viewer_combo()
+        self._viewer_reap_timer = QTimer(self)
+        self._viewer_reap_timer.timeout.connect(reap_viewer_processes)
+        self._viewer_reap_timer.start(5000)
         self.current_results, self.thumb_worker, self.dupes_worker, self.dupes_dialog = [], None, None, None
         self.index_worker, self.search_worker, self.garbage_worker, self.clean_worker = None, None, None, None
         self._preview_worker = None
@@ -2313,11 +2399,19 @@ class PhotoOrganizerWindow(QMainWindow):
         cmd = str(self.searcher.viewer_settings.get("image_viewer", "system"))
         idx = self.viewer_combo.findData(cmd)
         if idx < 0 and cmd != "system":
+            # Tolerate absolute paths: match an installed entry by executable name.
+            base = os.path.basename(cmd)
+            for i in range(self.viewer_combo.count()):
+                if os.path.basename(str(self.viewer_combo.itemData(i) or "")) == base:
+                    idx = i
+                    break
+        if idx < 0 and cmd != "system" and _find_executable(cmd):
             self.viewer_combo.addItem(f"Custom  ({cmd})", cmd); idx = self.viewer_combo.count() - 1
-        if idx >= 0:
-            self.viewer_combo.blockSignals(True)
-            self.viewer_combo.setCurrentIndex(idx)
-            self.viewer_combo.blockSignals(False)
+        if idx < 0:
+            idx = max(0, self.viewer_combo.findData("system"))
+        self.viewer_combo.blockSignals(True)
+        self.viewer_combo.setCurrentIndex(idx)
+        self.viewer_combo.blockSignals(False)
 
     def setup_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+F"), self, self.search_input.setFocus)
@@ -2442,19 +2536,24 @@ class PhotoOrganizerWindow(QMainWindow):
             argv = shlex.split(command)
         except ValueError:
             argv = [command]
-        # Geeqie needs an explicit flag to start full screen; it is
-        # single-instance, so an already-open window reuses/replaces its
-        # contents when handed a new file.
+        # Geeqie is single-instance: launched normally it hands the file to an
+        # already-open window and waits on the hand-off, which can lag. Force a
+        # fresh instance so the window appears immediately, and ask for
+        # full-screen (it otherwise opens windowed behind the main window).
+        env = None
         if "geeqie" in command.lower():
+            env = {**os.environ, "GQ_NEW_INSTANCE": "yes"}
             argv = [*argv, *GEEQIE_EXTRA_ARGS]
         argv = [*argv, path]
         try:
-            subprocess.Popen(argv, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
-            return True
+            proc = subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
         except Exception as e:
             logging.warning(f"Failed to launch image viewer {command!r}: {type(e).__name__}: {e}")
             return False
+        _VIEWER_PROCESSES.append(proc)
+        reap_viewer_processes()
+        return True
 
     def open_image_viewer(self, path: str) -> None:
         err = self.searcher._check_file_access(path)

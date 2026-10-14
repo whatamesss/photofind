@@ -24,6 +24,7 @@ def bare_searcher():
     s = object.__new__(pf.PhotoSearch)
     s.quality_settings = dict(pf.DEFAULT_QUALITY_SETTINGS)
     s.search_settings = dict(pf.DEFAULT_SEARCH_SETTINGS)
+    s.viewer_settings = dict(pf.DEFAULT_VIEWER_SETTINGS)
     s.image_paths = []
     s.image_metadata = {}
     s.indexed_set = set()
@@ -225,11 +226,52 @@ class SettingsTest(unittest.TestCase):
         s2._load_settings()
         self.assertEqual(s2.viewer_settings["image_viewer"], "gwenview")
 
+    def test_default_viewer_is_gwenview(self):
+        self.assertEqual(pf.DEFAULT_VIEWER_SETTINGS["image_viewer"], "gwenview")
+
+    def test_legacy_system_viewer_migrates_to_gwenview(self):
+        s = bare_searcher()
+        tmp = tempfile.mkdtemp()
+        s.settings_file = Path(tmp) / "settings.json"
+        with open(s.settings_file, "w") as f:
+            json.dump({"viewer": {"image_viewer": "system"}}, f)
+        s._load_settings()
+        self.assertEqual(s.viewer_settings["image_viewer"], "gwenview")
+
+    def test_explicit_viewer_not_migrated(self):
+        s = bare_searcher()
+        tmp = tempfile.mkdtemp()
+        s.settings_file = Path(tmp) / "settings.json"
+        with open(s.settings_file, "w") as f:
+            json.dump({"viewer": {"image_viewer": "geeqie"}}, f)
+        s._load_settings()
+        self.assertEqual(s.viewer_settings["image_viewer"], "geeqie")
+
 
 class ViewerDetectionTest(unittest.TestCase):
     """detect_image_viewers() derives its list from .desktop entries, so we
-    point it at a temporary applications directory rather than the real system.
+    point it at a temporary applications directory plus a temp bin dir of fake
+    executables, rather than touching the real system.
     """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = os.path.join(self.tmp, "home"); self.appdir = os.path.join(self.home, "applications")
+        self.data = os.path.join(self.tmp, "data"); self.appdir2 = os.path.join(self.data, "applications")
+        self.bindir = os.path.join(self.tmp, "bin")
+        for d in (self.appdir, self.appdir2, self.bindir):
+            os.makedirs(d, exist_ok=True)
+        # Fake executables for both allow-listed photo apps and a non-photo app.
+        for exe in ("gwenview", "geeqie", "gimp", "eog", "ristretto",
+                    "firefox", "libreoffice"):
+            p = os.path.join(self.bindir, exe)
+            with open(p, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(p, 0o755)
+
+    def _env(self):
+        return {"XDG_DATA_HOME": self.home, "XDG_DATA_DIRS": self.data,
+                "PATH": self.bindir + os.pathsep + os.environ.get("PATH", "")}
 
     def _desktop(self, appdir, filename, *, name, mimes, exec_line, hidden=False):
         body = [f"[Desktop Entry]", "Type=Application", f"Name={name}",
@@ -239,73 +281,114 @@ class ViewerDetectionTest(unittest.TestCase):
         with open(os.path.join(appdir, filename), "w") as f:
             f.write("\n".join(body) + "\n")
 
-    def test_detects_image_apps_and_skips_others(self):
-        tmp = tempfile.mkdtemp()
-        home = os.path.join(tmp, "home"); ad = os.path.join(home, "applications")
-        data = os.path.join(tmp, "data"); ad2 = os.path.join(data, "applications")
-        os.makedirs(ad); os.makedirs(ad2)
-        # Resolvable executable that exists on all Linux systems.
-        self.assertEqual(pf._find_executable("/bin/true"), True)
-        self._desktop(ad, "imgy.desktop", name="ImgY", mimes="image/jpeg;image/png;",
-                      exec_line="/bin/true %U")
-        # A non-image app must not appear.
-        self._desktop(ad, "text.desktop", name="TextY", mimes="text/plain;",
-                      exec_line="/bin/true %U")
-        # A hidden image app must not appear.
-        self._desktop(ad2, "hidden.desktop", name="HiddenY", mimes="image/png;",
-                      exec_line="/bin/true %U", hidden=True)
+    def test_detects_photo_apps_only(self):
+        self._desktop(self.appdir, "gwenview.desktop", name="Gwenview",
+                      mimes="image/jpeg;image/png;", exec_line="gwenview %U")
+        self._desktop(self.appdir, "geeqie.desktop", name="Geeqie",
+                      mimes="image/*", exec_line="geeqie %U")
+        self._desktop(self.appdir, "gimp.desktop", name="GIMP",
+                      mimes="image/png;image/x-xcf;", exec_line="gimp %U")
+        self._desktop(self.appdir, "eog.desktop", name="Image Viewer",
+                      mimes="image/png;", exec_line="eog %U")
+        # A browser and an office app that merely register for image/* must be
+        # excluded as inappropriate photo-viewer choices.
+        self._desktop(self.appdir, "browser.desktop", name="Firefox",
+                      mimes="image/jpeg;", exec_line="firefox %U")
+        self._desktop(self.appdir, "office.desktop", name="LibreOffice Draw",
+                      mimes="image/png;", exec_line="libreoffice --draw %U")
+        # A non-image app and a hidden image app must not appear.
+        self._desktop(self.appdir2, "text.desktop", name="TextY",
+                      mimes="text/plain;", exec_line="gwenview %U")
+        self._desktop(self.appdir2, "hidden.desktop", name="HiddenY",
+                      mimes="image/png;", exec_line="geeqie %U", hidden=True)
         # env-wrapped Exec should resolve to the real executable.
-        self._desktop(ad2, "envimg.desktop", name="EnvY", mimes="image/png;",
-                      exec_line="env GTK_THEME=x /bin/echo %U")
+        self._desktop(self.appdir2, "envimg.desktop", name="EnvY",
+                      mimes="image/png;", exec_line="env GTK_THEME=x ristretto %U")
 
-        env = {"XDG_DATA_HOME": home, "XDG_DATA_DIRS": data}
-        with mock.patch.dict(os.environ, env, clear=False):
+        with mock.patch.dict(os.environ, self._env(), clear=False):
             viewers = pf.detect_image_viewers()
+            resolvable = {cmd: pf._find_executable(cmd) for cmd, _ in viewers}
 
         self.assertIsInstance(viewers, list)
         for item in viewers:
             self.assertIsInstance(item, tuple)
             self.assertEqual(len(item), 2)
             self.assertIsInstance(item[0], str); self.assertIsInstance(item[1], str)
-        labels = {label for _cmd, label in viewers}
-        self.assertIn("ImgY", labels)
-        self.assertIn("EnvY", labels)
+
+        labels = [label for _cmd, label in viewers]
+        self.assertIn("Gwenview", labels)
+        self.assertIn("Geeqie", labels)
+        self.assertIn("GIMP", labels)
+        self.assertIn("Image Viewer", labels)   # eog
+        self.assertIn("EnvY", labels)           # env-wrapped eog
+        # Excluded: non-photo apps, non-image apps, hidden apps.
+        self.assertNotIn("Firefox", labels)
+        self.assertNotIn("LibreOffice Draw", labels)
         self.assertNotIn("TextY", labels)
         self.assertNotIn("HiddenY", labels)
+
+        # Preferred order: Gwenview first, then Geeqie, then GIMP.
+        self.assertEqual(viewers[0][1], "Gwenview")
+        self.assertEqual([label for _cmd, label in viewers[:3]],
+                         ["Gwenview", "Geeqie", "GIMP"])
+
         # Every returned command must be launchable.
-        for cmd, _label in viewers:
-            self.assertTrue(pf._find_executable(cmd), f"{cmd!r} not resolvable")
+        for cmd in resolvable:
+            self.assertTrue(resolvable[cmd], f"{cmd!r} not resolvable")
+
+    def test_photo_viewer_name_helpers(self):
+        self.assertEqual(pf._photo_viewer_name("gwenview %U"), "gwenview")
+        self.assertEqual(pf._photo_viewer_name("/usr/bin/gimp-2.10"), "gimp-2.10")
+        self.assertEqual(pf._photo_viewer_name("flatpak run org.gnome.Loupe"), "loupe")
+        self.assertIsNone(pf._photo_viewer_name("firefox %U"))
+        self.assertIsNone(pf._photo_viewer_name("libreoffice --draw"))
 
 
 class ViewerLaunchTest(unittest.TestCase):
-    """The launcher special-cases Geeqie (fullscreen start, single-instance)."""
+    """The launcher special-cases Geeqie (fresh full-screen instance)."""
 
     def _launch(self, command, path="/tmp/pic.jpg"):
         captured = {}
 
         class FakePopen:
-            def __init__(self, argv, **kwargs): captured["argv"] = argv
+            def __init__(self, argv, **kwargs): captured.update(kwargs, argv=argv)
+            def poll(self): return 0
 
         with mock.patch.object(pf.subprocess, "Popen", FakePopen):
             ok = pf.PhotoOrganizerWindow._launch_image_viewer(None, command, path)
-        return ok, captured.get("argv")
+        return ok, captured.get("argv"), captured.get("env")
 
-    def test_geeqie_gets_fullscreen_flag(self):
-        ok, argv = self._launch("geeqie")
+    def test_geeqie_fullscreen_and_new_instance(self):
+        ok, argv, env = self._launch("geeqie")
         self.assertTrue(ok)
         self.assertEqual(argv, ["geeqie", "--fullscreen", "/tmp/pic.jpg"])
+        self.assertEqual(env.get("GQ_NEW_INSTANCE"), "yes")
 
     def test_geeqie_matched_case_and_path_insensitively(self):
-        ok, argv = self._launch("/usr/bin/geeqie")
+        ok, argv, env = self._launch("/usr/bin/geeqie")
         self.assertEqual(argv, ["/usr/bin/geeqie", "--fullscreen", "/tmp/pic.jpg"])
+        self.assertEqual(env.get("GQ_NEW_INSTANCE"), "yes")
 
     def test_other_viewer_unmodified(self):
-        ok, argv = self._launch("feh")
+        ok, argv, env = self._launch("feh")
         self.assertEqual(argv, ["feh", "/tmp/pic.jpg"])
+        self.assertIsNone(env)
 
     def test_viewer_with_args_keeps_args_then_appends_path(self):
-        ok, argv = self._launch("flatpak run org.example.View")
+        ok, argv, env = self._launch("flatpak run org.example.View")
         self.assertEqual(argv, ["flatpak", "run", "org.example.View", "/tmp/pic.jpg"])
+        self.assertIsNone(env)
+
+    def test_reap_drops_finished_keeps_running(self):
+        class Proc:
+            def __init__(self, rc): self._rc = rc
+            def poll(self): return self._rc
+
+        alive, dead = Proc(None), Proc(0)
+        pf._VIEWER_PROCESSES[:] = [alive, dead]
+        pf.reap_viewer_processes()
+        self.assertEqual(pf._VIEWER_PROCESSES, [alive])
+        pf._VIEWER_PROCESSES[:] = []
 
 
 if __name__ == "__main__":
