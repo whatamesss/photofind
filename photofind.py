@@ -45,7 +45,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QToolBar, QHBoxLayout, QPushButton,
     QMenu, QDialog, QAbstractItemView, QFrame, QProgressBar,
     QToolButton, QTabWidget, QDoubleSpinBox, QSpinBox, QFormLayout,
-    QGroupBox, QDialogButtonBox, QInputDialog, QComboBox
+    QGroupBox, QDialogButtonBox, QComboBox
 )
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QAction, QKeySequence, QShortcut, QDesktopServices
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint, QTimer, QLibraryInfo, QLoggingCategory
@@ -299,6 +299,51 @@ def open_in_file_browser(path: str) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(real_path)))
     except Exception:
         pass
+
+def _pil_image_to_qimage(img: Image.Image) -> QImage:
+    """Copy a Pillow image into a standalone RGBA QImage.
+
+    RGBA is used unconditionally: it keeps every scanline 4-byte aligned (a
+    QImage requirement) and preserves transparency. ``.copy()`` detaches the
+    result from the temporary Python buffer.
+    """
+    if img.mode != "RGBA": img = img.convert("RGBA")
+    data = img.tobytes("raw", "RGBA")
+    return QImage(data, img.width, img.height, img.width * 4,
+                  QImage.Format.Format_RGBA8888).copy()
+
+def load_image_for_clipboard(path: str) -> QImage:
+    """Decode an image the way it is displayed (EXIF orientation applied)."""
+    with Image.open(path) as opened:
+        opened.load()
+        return _pil_image_to_qimage(ImageOps.exif_transpose(opened))
+
+def copy_image_to_clipboard(path: str) -> Optional[str]:
+    """Copy the pixels of the image at ``path`` to the system clipboard.
+
+    Returns None on success, or a human-readable error message on failure.
+    Unlike putting a file URL on the clipboard, this lets the user paste the
+    actual picture into chat, document, and image-editing apps (the feature
+    Geeqie has and Gwenview lacks). Must be called from the GUI thread.
+    """
+    try:
+        qimg = load_image_for_clipboard(path)
+    except Exception as e:
+        logging.warning(f"Failed to load image for clipboard {path}: {type(e).__name__}: {e}")
+        return f"Could not read image:\n{e}"
+    if qimg.isNull(): return "Could not decode image."
+    QApplication.clipboard().setImage(qimg)
+    return None
+
+def copy_image_with_ui(parent: QWidget, path: str, status_cb: Callable[[str], None]) -> None:
+    """Copy ``path`` to the clipboard, showing a busy cursor and any error."""
+    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+    try:
+        err = copy_image_to_clipboard(path)
+    finally:
+        QApplication.restoreOverrideCursor()
+    if err: QMessageBox.warning(parent, "Copy Image to Clipboard", err)
+    else: status_cb(f"Copied {os.path.basename(path)} to the clipboard.")
 
 def _numpy_to_clip_arrays(img: Image.Image) -> Tuple[np.ndarray, float, float, float, float, float, float]:
     arr_uint8 = np.array(img)
@@ -1890,6 +1935,9 @@ class DuplicateDialog(QDialog):
 
     def open_in_explorer(self, path: str) -> None: open_in_file_browser(path)
 
+    def copy_image_to_clipboard(self, path: str) -> None:
+        copy_image_with_ui(self, path, self.info_label.setText)
+
     def show_image_context_menu(self, position: QPoint) -> None:
         item = self.image_list.itemAt(position)
         if not item: return
@@ -1899,6 +1947,8 @@ class DuplicateDialog(QDialog):
         menu = QMenu()
         menu.addAction("Open in File Browser").triggered.connect(
             lambda: self.open_in_explorer(selected_items[0].data(Qt.ItemDataRole.UserRole)))
+        menu.addAction("Copy Image to Clipboard").triggered.connect(
+            lambda: self.copy_image_to_clipboard(selected_items[0].data(Qt.ItemDataRole.UserRole)))
         menu.addSeparator()
         delete_action = menu.addAction(f"Move {len(selected_items)} Photos to Trash")
         delete_action.triggered.connect(
@@ -2281,6 +2331,46 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+class FolderChoiceDialog(QDialog):
+    """Pick one folder from a list, with "Open in File Manager" on right-click."""
+
+    def __init__(self, title: str, prompt: str, labels: List[str], folders: List[str],
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle(title); self.resize(640, 360)
+        layout = QVBoxLayout(self)
+        prompt_label = QLabel(prompt); prompt_label.setWordWrap(True); layout.addWidget(prompt_label)
+        self.list_widget = QListWidget()
+        for text, folder in zip(labels, folders):
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, folder)
+            item.setToolTip(folder)
+            self.list_widget.addItem(item)
+        if self.list_widget.count(): self.list_widget.setCurrentRow(0)
+        # Double-clicking a folder accepts it, like QInputDialog.getItem().
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self.accept())
+        self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._show_context_menu)
+        layout.addWidget(self.list_widget, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _show_context_menu(self, position: QPoint) -> None:
+        item = self.list_widget.itemAt(position)
+        if not item: return
+        if not item.isSelected(): self.list_widget.clearSelection(); item.setSelected(True)
+        self.list_widget.setCurrentItem(item)
+        menu = QMenu(self)
+        menu.addAction("Open in File Manager").triggered.connect(
+            lambda: open_in_file_browser(item.data(Qt.ItemDataRole.UserRole)))
+        menu.exec(self.list_widget.viewport().mapToGlobal(position))
+
+    def selected_folder(self) -> Optional[str]:
+        item = self.list_widget.currentItem()
+        return str(item.data(Qt.ItemDataRole.UserRole)) if item else None
+
+
 class PhotoOrganizerWindow(QMainWindow):
     preview_results = pyqtSignal(int, float)
     quality_preview_results = pyqtSignal(int)
@@ -2416,6 +2506,7 @@ class PhotoOrganizerWindow(QMainWindow):
     def setup_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+F"), self, self.search_input.setFocus)
         QShortcut(QKeySequence("Ctrl+A"), self, self.list_widget.selectAll)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.Copy), self.list_widget, self._copy_current_image, context=Qt.ShortcutContext.WidgetShortcut)
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self, self.delete_selected)
         QShortcut(QKeySequence("Escape"), self, self.cancel_current_operation)
         # Bind Enter specifically to the list widget using WidgetShortcut 
@@ -2464,12 +2555,23 @@ class PhotoOrganizerWindow(QMainWindow):
         if selected_count == 1:
             path = selected_items[0].data(Qt.ItemDataRole.UserRole)
             menu.addAction("Open in Image Viewer").triggered.connect(lambda: self.open_image_viewer(path))
+            copy_action = menu.addAction("Copy Image to Clipboard")
+            copy_action.triggered.connect(lambda: self._copy_photo_to_clipboard(path))
             menu.addAction("Open in File Browser").triggered.connect(lambda: open_in_file_browser(path))
             menu.addAction("Exclude Folder from Index\u2026").triggered.connect(lambda: self.exclude_folder_dialog(path))
             menu.addSeparator()
         delete_action = menu.addAction(f"Move {selected_count} Photos to Trash" if selected_count > 1 else "Move to Trash")
         delete_action.triggered.connect(lambda: self.delete_photos_action([i.data(Qt.ItemDataRole.UserRole) for i in selected_items], selected_items))
         menu.exec(self.list_widget.viewport().mapToGlobal(position))
+
+    def _copy_current_image(self) -> None:
+        item = self.list_widget.currentItem()
+        if item: self._copy_photo_to_clipboard(item.data(Qt.ItemDataRole.UserRole))
+
+    def _copy_photo_to_clipboard(self, path: str) -> None:
+        err = self.searcher._check_file_access(path)
+        if err: self._show_temp_status(err); return
+        copy_image_with_ui(self, path, self._show_temp_status)
 
     def delete_photos_action(self, paths: List[str], items: List[QListWidgetItem]) -> None:
         count = len(paths)
@@ -2506,12 +2608,13 @@ class PhotoOrganizerWindow(QMainWindow):
             labels.append(f"{folder}    ({count} indexed photo{'' if count == 1 else 's'})")
             folders.append(folder)
         if not folders: return
-        choice, ok = QInputDialog.getItem(
-            self, "Exclude Folder from Index",
+        dialog = FolderChoiceDialog(
+            "Exclude Folder from Index",
             "Choose the folder to exclude (its subfolders are excluded too):",
-            labels, 0, False)
-        if not ok or not choice: return
-        folder = folders[labels.index(choice)]
+            labels, folders, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted: return
+        folder = dialog.selected_folder()
+        if not folder: return
         count = self._indexed_count_under(folder)
         msg = (f"Exclude this folder from the index?\n\n{folder}\n\n"
                f"{count} indexed photo(s) will be removed now. Future indexing will skip "

@@ -14,6 +14,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from PIL import Image
+
 _ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("photofind", _ROOT / "photofind.py")
 pf = importlib.util.module_from_spec(_spec)
@@ -246,6 +248,48 @@ class SettingsTest(unittest.TestCase):
             json.dump({"viewer": {"image_viewer": "geeqie"}}, f)
         s._load_settings()
         self.assertEqual(s.viewer_settings["image_viewer"], "geeqie")
+
+
+class ClipboardCopyTest(unittest.TestCase):
+    """Right-click "Copy Image to Clipboard" copies pixels, not a file URL."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _png(self, name, size=(4, 3), color=(10, 20, 30, 128)):
+        path = os.path.join(self.tmp, name)
+        Image.new("RGBA", size, color).save(path)
+        return path
+
+    def test_rgba_pixels_and_alpha_preserved(self):
+        qimg = pf.load_image_for_clipboard(self._png("rgba.png"))
+        self.assertFalse(qimg.isNull())
+        self.assertEqual((qimg.width(), qimg.height()), (4, 3))
+        self.assertEqual(qimg.pixelColor(1, 1).getRgb(), (10, 20, 30, 128))
+
+    def test_palette_and_greyscale_are_converted(self):
+        pal = os.path.join(self.tmp, "pal.png")
+        Image.new("P", (2, 2), 5).save(pal)
+        grey = os.path.join(self.tmp, "grey.png")
+        Image.new("L", (3, 1), 99).save(grey)
+        for path in (pal, grey):
+            qimg = pf.load_image_for_clipboard(path)
+            self.assertFalse(qimg.isNull(), path)
+            self.assertEqual(qimg.format(), pf.QImage.Format.Format_RGBA8888)
+
+    def test_exif_orientation_is_applied(self):
+        # A landscape file tagged "rotate 90" is displayed portrait.
+        path = os.path.join(self.tmp, "rotated.jpg")
+        img = Image.new("RGB", (8, 4), (200, 100, 50))
+        exif = Image.Exif(); exif[0x0112] = 6
+        img.save(path, exif=exif)
+        qimg = pf.load_image_for_clipboard(path)
+        self.assertEqual((qimg.width(), qimg.height()), (4, 8))
+
+    def test_unreadable_file_returns_message(self):
+        err = pf.copy_image_to_clipboard(os.path.join(self.tmp, "missing.jpg"))
+        self.assertIsInstance(err, str)
+        self.assertIn("Could not read image", err)
 
 
 class ViewerDetectionTest(unittest.TestCase):
