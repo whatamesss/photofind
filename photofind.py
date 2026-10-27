@@ -2926,16 +2926,24 @@ if __name__ == "__main__":
             for p in [cache_path / "photo_index.json", cache_path / "photo_embeddings.pt", cache_path / "photo_metadata.json"]:
                 if p.exists(): p.unlink()
         # Show splash screen while loading
-        splash_pixmap = QPixmap()
-        # Try to use the app icon if available
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photofind.png")
-        if os.path.exists(icon_path):
-            splash_pixmap = QPixmap(icon_path).scaled(256, 256, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        splash = QSplashScreen(splash_pixmap)
-        splash.show()
-        splash.showMessage("PhotoFind - Starting up...\nLoading AI Model...", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignCenter, Qt.GlobalColor.white)
-        app.processEvents()
+        splash = None
+        try:
+            splash_pixmap = QPixmap()
+            # Try to use the app icon if available
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photofind.png")
+            if os.path.exists(icon_path):
+                splash_pixmap = QPixmap(icon_path).scaled(256, 256, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            splash = QSplashScreen(splash_pixmap)
+            splash.show()
+            splash.showMessage("PhotoFind - Starting up...\nLoading AI Model...", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignCenter, Qt.GlobalColor.white)
+            app.processEvents()
+        except Exception:
+            splash = None
         window = PhotoOrganizerWindow()
-        splash.finish(window)
+        if splash is not None:
+            try:
+                splash.finish(window)
+            except Exception:
+                pass
         window.show()
         sys.exit(app.exec())
