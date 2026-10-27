@@ -2936,7 +2936,7 @@ if __name__ == "__main__":
             splash = QSplashScreen(splash_pixmap)
             splash.show()
             splash.showMessage("PhotoFind - Starting up\nLoading AI Model...", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignCenter, Qt.GlobalColor.white)
-            for _ in range(10):
+            for _ in range(20):
                 app.processEvents()
         except Exception as e:
             print(f"Splash error: {e}")
@@ -2945,6 +2945,10 @@ if __name__ == "__main__":
         window_ref = []
         def _create_main():
             try:
+                if splash is not None:
+                    splash.showMessage("PhotoFind - Initializing...", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignCenter, Qt.GlobalColor.white)
+                    for _ in range(5):
+                        app.processEvents()
                 window_ref.append(PhotoOrganizerWindow())
                 if splash is not None and window_ref:
                     try:
@@ -2962,5 +2966,5 @@ if __name__ == "__main__":
                         pass
                 raise
 
-        QTimer.singleShot(50, _create_main)
+        QTimer.singleShot(10, _create_main)
         sys.exit(app.exec())
