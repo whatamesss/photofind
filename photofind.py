@@ -2928,8 +2928,20 @@ if __name__ == "__main__":
         # Show splash screen while loading
         splash = None
         try:
-            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photofind.png")
-            splash_pixmap = QPixmap(icon_path) if os.path.exists(icon_path) else QPixmap(512, 512)
+            icon_path = None
+            # Try relative to script first (development)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            candidates = [
+                os.path.join(script_dir, "photofind.png"),
+                "/usr/share/icons/hicolor/256x256/apps/photofind.png",
+                "/usr/share/pixmaps/photofind.png",
+                os.path.expanduser("~/.local/share/icons/hicolor/256x256/apps/photofind.png"),
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    icon_path = c
+                    break
+            splash_pixmap = QPixmap(icon_path) if icon_path and os.path.exists(icon_path) else QPixmap(512, 512)
             if splash_pixmap.isNull():
                 splash_pixmap = QPixmap(512, 512)
             splash_pixmap = splash_pixmap.scaled(512, 512, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
