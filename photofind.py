@@ -45,7 +45,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QToolBar, QHBoxLayout, QPushButton,
     QMenu, QDialog, QAbstractItemView, QFrame, QProgressBar,
     QToolButton, QTabWidget, QDoubleSpinBox, QSpinBox, QFormLayout,
-    QGroupBox, QDialogButtonBox, QComboBox
+    QGroupBox, QDialogButtonBox, QComboBox, QSplashScreen
 )
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QAction, QKeySequence, QShortcut, QDesktopServices
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint, QTimer, QLibraryInfo, QLoggingCategory
@@ -2925,5 +2925,17 @@ if __name__ == "__main__":
         if args.reindex:
             for p in [cache_path / "photo_index.json", cache_path / "photo_embeddings.pt", cache_path / "photo_metadata.json"]:
                 if p.exists(): p.unlink()
-        window = PhotoOrganizerWindow(); window.show()
+        # Show splash screen while loading
+        splash_pixmap = QPixmap()
+        # Try to use the app icon if available
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photofind.png")
+        if os.path.exists(icon_path):
+            splash_pixmap = QPixmap(icon_path).scaled(256, 256, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        splash = QSplashScreen(splash_pixmap)
+        splash.show()
+        splash.showMessage("PhotoFind - Starting up...\nLoading AI Model...", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignCenter, Qt.GlobalColor.white)
+        app.processEvents()
+        window = PhotoOrganizerWindow()
+        splash.finish(window)
+        window.show()
         sys.exit(app.exec())
