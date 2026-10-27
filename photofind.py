@@ -2928,16 +2928,18 @@ if __name__ == "__main__":
         # Show splash screen while loading
         splash = None
         try:
-            splash_pixmap = QPixmap()
-            # Try to use the app icon if available
             icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photofind.png")
-            if os.path.exists(icon_path):
-                splash_pixmap = QPixmap(icon_path).scaled(256, 256, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            splash = QSplashScreen(splash_pixmap)
+            splash_pixmap = QPixmap(icon_path) if os.path.exists(icon_path) else QPixmap(400, 300)
+            if splash_pixmap.isNull():
+                splash_pixmap = QPixmap(400, 300)
+            splash_pixmap = splash_pixmap.scaled(400, 300, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            splash = QSplashScreen(splash_pixmap, Qt.WindowType.WindowStaysOnTopHint)
+            splash.setWindowFlags(Qt.WindowType.SplashScreen | Qt.WindowType.WindowStaysOnTopHint)
             splash.show()
-            splash.showMessage("PhotoFind - Starting up...\nLoading AI Model...", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignCenter, Qt.GlobalColor.white)
+            splash.showMessage("PhotoFind - Starting up...\nLoading AI Model...", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignCenter, Qt.GlobalColor.black)
             app.processEvents()
-        except Exception:
+        except Exception as e:
+            print(f"Splash error: {e}")
             splash = None
         window = PhotoOrganizerWindow()
         if splash is not None:
